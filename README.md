@@ -2,6 +2,13 @@
 
 A full multi-page Cloudflare Worker app built from the uploaded treasury and loan ledger files.
 
+## Live site
+
+The app is deployed on Cloudflare and serves the custom domains:
+
+- https://knockoutforever.com
+- https://www.knockoutforever.com
+
 ## Pages
 
 - `/` — home
