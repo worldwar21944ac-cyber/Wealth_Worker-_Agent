@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "wealth-worker",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-15",
+  "workers_dev": true,
+  "preview_urls": true,
+  "vars": {
+    "ENVIRONMENT": "preview",
+    "ALLOWED_ORIGIN": "*"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}
