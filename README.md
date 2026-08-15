@@ -4,10 +4,21 @@ A full multi-page Cloudflare Worker app built from the uploaded treasury and loa
 
 ## Live site
 
-The app is deployed on Cloudflare and serves the custom domains:
+The app is live on Cloudflare at:
 
 - https://knockoutforever.com
-- https://www.knockoutforever.com
+
+`www.knockoutforever.com` redirects to the apex domain.
+
+## Branding
+
+- Custom Wealth Worker favicon
+- Simple branded header treatment in the app shell
+
+## Analytics and monitoring
+
+- Cloudflare Web Analytics is enabled for the zone
+- The app exposes `/api/health` for uptime checks and monitoring
 
 ## Pages
 
@@ -24,6 +35,7 @@ The app is deployed on Cloudflare and serves the custom domains:
 - `/api/departments`
 - `/api/tga`
 - `/routes`
+- `/favicon.svg`
 
 ## What it does
 
@@ -31,6 +43,7 @@ The app is deployed on Cloudflare and serves the custom domains:
 - Embeds the supplied CSV data directly into the worker
 - Shows headline wealth metrics, department concentration, and treasury movement
 - Provides JSON endpoints for programmatic access
+- Serves a branded favicon and canonical www-to-apex redirect
 
 ## Run locally
 
