@@ -39,12 +39,24 @@ const DATA = {
   ],
 };
 
+const HARDWARE_CATALOG = [
+  { id: "VO-SRD-V1-LOCK", name: "VO SRD V1 Lock", category: "Governance / Engineering", status: "Reference artifact", access: "enterprise" },
+  { id: "VO-L2-SOLAR-OPTICAL", name: "VO L2 Solar Optical Twin", category: "Digital Twin", status: "Reference artifact", access: "enterprise" },
+  { id: "VO-L1-FEA-EXECUTION", name: "VO L1 FEA Execution", category: "Structural Analysis", status: "Reference artifact", access: "enterprise" },
+  { id: "VO-MODULAR-BOM-V0", name: "VO Modular BOM V0", category: "Bill of Materials", status: "Reference artifact", access: "enterprise" },
+  { id: "VO-DEEP-DIVE-MEMO", name: "VO Deep Dive Memo", category: "Technical Memo", status: "Reference artifact", access: "enterprise" },
+  { id: "SOVEREIGN-STACK-WHITEPAPER-V13", name: "Sovereign Stack Whitepaper v1.3", category: "Architecture", status: "Reference artifact", access: "enterprise" },
+  { id: "VOID-TECH-ARCHITECTURE-STUDY", name: "Void Tech Architecture Study", category: "Architecture Study", status: "Reference artifact", access: "enterprise" },
+];
+
 const ROUTES = {
   "/": "home",
   "/overview": "portfolio overview",
   "/treasury": "treasury view",
   "/departments": "department concentration",
   "/insights": "analysis and notes",
+  "/?vault=hardware": "hardware vault",
+  "/routes?catalog=hardware": "hardware catalog JSON",
   "/api/health": "heartbeat",
   "/api/summary": "summary JSON",
   "/api/departments": "department JSON",
@@ -52,198 +64,24 @@ const ROUTES = {
   "/routes": "route index JSON",
 };
 
-const STYLE = `body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#08111f;color:#e8eefc}a{color:inherit;text-decoration:none}.wrap{max-width:1180px;margin:0 auto;padding:24px}.hero,.panel,.card{background:rgba(16,27,47,.92);border:1px solid rgba(255,255,255,.09);border-radius:18px}.hero{padding:24px}.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.nav a{display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid rgba(255,255,255,.09);color:#9eb0d1;margin:6px 8px 0 0}.nav a.active{background:rgba(125,211,252,.14);color:#fff;border-color:rgba(125,211,252,.4)}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:16px}.card{padding:16px}.label{color:#9eb0d1;font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.value{font-size:1.4rem;font-weight:700;margin-top:8px}.sub{color:#9eb0d1;margin-top:6px}.section{margin-top:16px}.two{display:grid;grid-template-columns:1.4fr .9fr;gap:12px}.panel{padding:16px}.muted{color:#9eb0d1;line-height:1.55}.table{width:100%;border-collapse:collapse}.table th,.table td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.09);text-align:left}.table th{color:#9eb0d1;font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.footer{margin-top:16px;color:#9eb0d1;font-size:.92rem}code{background:rgba(255,255,255,.08);padding:2px 6px;border-radius:6px}`;
+const STYLE = `body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#08111f;color:#e8eefc}a{color:inherit;text-decoration:none}.wrap{max-width:1180px;margin:0 auto;padding:24px}.hero,.panel,.card{background:rgba(16,27,47,.92);border:1px solid rgba(255,255,255,.09);border-radius:18px}.hero{padding:24px}.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.nav a{display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid rgba(255,255,255,.09);color:#9eb0d1;margin:6px 8px 0 0}.nav a.active{background:rgba(125,211,252,.14);color:#fff;border-color:rgba(125,211,252,.4)}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:16px}.card{padding:16px}.label{color:#9eb0d1;font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.value{font-size:1.4rem;font-weight:700;margin-top:8px}.sub{color:#9eb0d1;margin-top:6px}.section{margin-top:16px}.two{display:grid;grid-template-columns:1.4fr .9fr;gap:12px}.panel{padding:16px}.muted{color:#9eb0d1;line-height:1.55}.table{width:100%;border-collapse:collapse}.table th,.table td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.09);text-align:left}.table th{color:#9eb0d1;font-size:.82rem;text-transform:uppercase;letter-spacing:.08em}.footer{margin-top:16px;color:#9eb0d1;font-size:.92rem}code{background:rgba(255,255,255,.08);padding:2px 6px;border-radius:6px}.badge{display:inline-block;padding:5px 9px;border-radius:999px;background:rgba(125,211,252,.12);border:1px solid rgba(125,211,252,.3);color:#d9f2ff;font-size:.8rem}.cta{display:inline-block;margin-top:10px;padding:10px 14px;border-radius:10px;background:#7dd3fc;color:#07111f;font-weight:700}.vault{border-color:rgba(125,211,252,.28)}`;
 
-function fmt(v) {
-  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(v);
-}
-
-function compact(v) {
-  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", notation: "compact", maximumFractionDigits: 2 }).format(v);
-}
-
-function esc(v) {
-  return String(v)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function rid(request) {
-  return request.headers.get("cf-ray") || crypto.randomUUID();
-}
-
-function json(data, status = 200, headers = {}) {
-  return Response.json(data, {
-    status,
-    headers: {
-      "cache-control": "no-store",
-      "content-type": "application/json; charset=utf-8",
-      "x-content-type-options": "nosniff",
-      ...headers,
-    },
-  });
-}
-
-function cors(request, env) {
-  const origin = request.headers.get("origin");
-  const allowed = env.ALLOWED_ORIGIN || "*";
-  const allow = allowed === "*" ? "*" : origin === allowed ? allowed : "null";
-  return {
-    "access-control-allow-origin": allow,
-    "access-control-allow-methods": "GET, POST, OPTIONS",
-    "access-control-allow-headers": "content-type, authorization",
-    "access-control-max-age": "86400",
-    vary: "Origin",
-  };
-}
-
-function compute() {
-  const topFive = DATA.topDepartments.slice(0, 5);
-  const topFiveTotal = topFive.reduce((sum, item) => sum + item.loans, 0);
-  const latest = DATA.tgaSeriesRecent[DATA.tgaSeriesRecent.length - 1];
-  const previous = DATA.tgaSeriesRecent[DATA.tgaSeriesRecent.length - 2];
-  return {
-    loanReceivables: DATA.summary.loanReceivables,
-    capitalizedInterestReceivable: DATA.summary.capitalizedInterestReceivable,
-    interestReceivable: DATA.summary.interestReceivable,
-    interestRevenue: DATA.summary.interestRevenue,
-    gainAmount: DATA.summary.gainAmount,
-    lossAmount: DATA.summary.lossAmount,
-    netGainLoss: DATA.summary.netGainLoss,
-    departmentCount: DATA.summary.departmentCount,
-    tgaPoints: DATA.summary.tgaPoints,
-    tgaHigh: DATA.summary.tgaHigh,
-    tgaLow: DATA.summary.tgaLow,
-    tgaAverage: DATA.summary.tgaAverage,
-    periodStart: DATA.summary.periodStart,
-    periodEnd: DATA.summary.periodEnd,
-    topFiveTotal,
-    topFiveShare: topFiveTotal / DATA.summary.loanReceivables,
-    latestTgaClosing: latest.closing,
-    latestTgaOpening: latest.opening,
-    latestTgaChange: latest.closing - previous.closing,
-    topDepartments: DATA.topDepartments,
-    tgaSeriesRecent: DATA.tgaSeriesRecent,
-  };
-}
-
-function nav(active) {
-  return [
-    ["/", "Home"],
-    ["/overview", "Overview"],
-    ["/treasury", "Treasury"],
-    ["/departments", "Departments"],
-    ["/insights", "Insights"],
-  ]
-    .map(([href, label]) => `<a class="${active === href ? "active" : ""}" href="${href}">${label}</a>`)
-    .join("");
-}
-
-function card(label, value, sub) {
-  return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`;
-}
-
-function shell(title, eyebrow, intro, active, body) {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${STYLE}</style></head><body><div class="wrap"><div class="hero"><div class="row"><strong>Wealth Worker</strong><span class="label">${esc(eyebrow)}</span></div><h1>${esc(title)}</h1><p class="muted">${esc(intro)}</p><div class="nav">${nav(active)}</div></div>${body}<div class="footer">Routes: <code>/api/health</code>, <code>/api/summary</code>, <code>/api/departments</code>, <code>/api/tga</code>, <code>/routes</code></div></div></body></html>`;
-}
-
-function home(p) {
-  return shell(
-    "Wealth Worker — Home",
-    "Finance dashboard",
-    "A multi-page edge dashboard for Treasury and lending analytics.",
-    "/",
-    `<div class="grid">${card("Loan receivables", compact(p.loanReceivables), "Principal outstanding")}${card("Interest receivable", compact(p.interestReceivable), "Earned but not yet collected")}${card("Interest revenue", compact(p.interestRevenue), "Revenue recognized in the ledger")}${card("Net gain / loss", compact(p.netGainLoss), p.netGainLoss < 0 ? "Negative for the period" : "Positive for the period")}</div><div class="section two"><div class="panel"><div class="label">Quick read</div><p class="muted">The top five departments account for ${(p.topFiveShare * 100).toFixed(1)}% of loan receivables.</p><p class="muted">Treasury closed at ${fmt(p.latestTgaClosing)} in the latest reading.</p></div><div class="panel"><div class="label">API snapshot</div><p class="muted"><strong>${p.departmentCount}</strong> departments tracked.</p><p class="muted"><strong>${p.tgaPoints}</strong> treasury observations embedded.</p></div></div>`,
-  );
-}
-
-function overview(p) {
-  return shell(
-    "Wealth Worker — Overview",
-    "Portfolio overview",
-    "Receivables, revenue, gain/loss, and concentration in one view.",
-    "/overview",
-    `<div class="grid">${card("Loan receivables", compact(p.loanReceivables), "Total principal outstanding")}${card("Capitalized interest", compact(p.capitalizedInterestReceivable), "Capitalized interest receivable")}${card("Interest revenue", compact(p.interestRevenue), "Recognized revenue")}${card("Net gain / loss", compact(p.netGainLoss), "Period result")}</div><div class="section two"><div class="panel"><div class="label">Concentration</div><p class="muted">Top five departments hold ${(p.topFiveShare * 100).toFixed(1)}% of loan receivables.</p><p class="muted">Top-five loan total: ${fmt(p.topFiveTotal)}</p></div><div class="panel"><div class="label">Spread</div><p class="muted">Interest revenue exceeds loss amount by ${fmt(p.interestRevenue - p.lossAmount)}</p></div></div>`,
-  );
-}
-
-function treasury(p) {
-  const rows = p.tgaSeriesRecent
-    .map((r) => `<tr><td>${esc(r.date)}</td><td>${fmt(r.opening)}</td><td>${fmt(r.deposits)}</td><td>${fmt(r.withdrawals)}</td><td>${fmt(r.closing)}</td></tr>`)
-    .join("");
-  return shell(
-    "Wealth Worker — Treasury",
-    "Treasury cash trend",
-    "Recent Treasury cash movements and closing balances.",
-    "/treasury",
-    `<div class="section panel"><table class="table"><thead><tr><th>Date</th><th>Opening</th><th>Deposits</th><th>Withdrawals</th><th>Closing</th></tr></thead><tbody>${rows}</tbody></table></div><div class="section grid">${card("High", fmt(p.tgaHigh), "Highest observed close")}${card("Low", fmt(p.tgaLow), "Lowest observed close")}${card("Average", fmt(p.tgaAverage), "Average closing balance")}${card("Latest move", fmt(p.latestTgaChange), "Change from prior close")}</div>`,
-  );
-}
-
-function departments(p) {
-  const rows = p.topDepartments
-    .map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.dept)}</td><td>${fmt(r.loans)}</td><td>${fmt(r.interestRevenue)}</td><td>${fmt(r.interestReceivable)}</td></tr>`)
-    .join("");
-  return shell(
-    "Wealth Worker — Departments",
-    "Department concentration",
-    "The departments driving most of the ledger activity.",
-    "/departments",
-    `<div class="section panel"><table class="table"><thead><tr><th>Rank</th><th>Department</th><th>Loan receivables</th><th>Interest revenue</th><th>Interest receivable</th></tr></thead><tbody>${rows}</tbody></table></div>`,
-  );
-}
-
-function insights() {
-  return shell(
-    "Wealth Worker — Insights",
-    "Analysis and notes",
-    "Plain-English takeaways from the embedded data.",
-    "/insights",
-    `<div class="section two"><div class="panel"><p><strong>Concentration risk</strong><br><span class="muted">Department 091 dominates the portfolio, and the top five departments are the clear center of gravity.</span></p><p><strong>Treasury movement</strong><br><span class="muted">The TGA series shows regular swings, including late-period inflows and outflows.</span></p></div><div class="panel"><p><strong>Revenue profile</strong><br><span class="muted">Interest revenue is large relative to the reported loss amount, even though net gain/loss remains negative.</span></p><p><strong>App shape</strong><br><span class="muted">The worker serves multiple pages plus JSON routes for dashboard and API use.</span></p></div></div>`,
-  );
-}
-
-function render(path, p) {
-  if (path === "/") return home(p);
-  if (path === "/overview") return overview(p);
-  if (path === "/treasury") return treasury(p);
-  if (path === "/departments") return departments(p);
-  if (path === "/insights") return insights(p);
-  return null;
-}
-
-export default {
-  async fetch(request, env) {
-    const requestId = rid(request);
-    const c = cors(request, env);
-    const url = new URL(request.url);
-    const p = compute();
-
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: c });
-
-    try {
-      if (request.method === "GET" && ["/", "/overview", "/treasury", "/departments", "/insights"].includes(url.pathname)) {
-        return new Response(render(url.pathname, p), {
-          status: 200,
-          headers: {
-            "content-type": "text/html; charset=utf-8",
-            "cache-control": "no-store",
-            "x-content-type-options": "nosniff",
-          },
-        });
-      }
-      if (request.method === "GET" && url.pathname === "/api/health") return json({ ok: true, service: "wealth-worker", request_id: requestId }, 200, c);
-      if (request.method === "GET" && url.pathname === "/api/summary") return json({ request_id: requestId, loanReceivables: p.loanReceivables, capitalizedInterestReceivable: p.capitalizedInterestReceivable, interestReceivable: p.interestReceivable, interestRevenue: p.interestRevenue, gainAmount: p.gainAmount, lossAmount: p.lossAmount, netGainLoss: p.netGainLoss, departmentCount: p.departmentCount, tgaPoints: p.tgaPoints, tgaHigh: p.tgaHigh, tgaLow: p.tgaLow, tgaAverage: p.tgaAverage, periodStart: p.periodStart, periodEnd: p.periodEnd, topFiveTotal: p.topFiveTotal, topFiveShare: p.topFiveShare, latestTgaClosing: p.latestTgaClosing, latestTgaOpening: p.latestTgaOpening, latestTgaChange: p.latestTgaChange }, 200, c);
-      if (request.method === "GET" && url.pathname === "/api/departments") return json({ request_id: requestId, departments: p.topDepartments }, 200, c);
-      if (request.method === "GET" && url.pathname === "/api/tga") return json({ request_id: requestId, series: p.tgaSeriesRecent }, 200, c);
-      if (request.method === "GET" && url.pathname === "/routes") return json({ request_id: requestId, routes: ROUTES }, 200, c);
-      return json({ error: "Not found", code: "NOT_FOUND", request_id: requestId }, 404, c);
-    } catch (error) {
-      console.error(JSON.stringify({ event: "unhandled_error", request_id: requestId, message: error instanceof Error ? error.message : "Unknown error" }));
-      return json({ error: "Internal server error", code: "INTERNAL_ERROR", request_id: requestId }, 500, c);
-    }
-  },
-};
+function fmt(v){return new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",maximumFractionDigits:2}).format(v)}
+function compact(v){return new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",notation:"compact",maximumFractionDigits:2}).format(v)}
+function esc(v){return String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;").replace(/'/g,"&#39;")}
+function rid(request){return request.headers.get("cf-ray")||crypto.randomUUID()}
+function json(data,status=200,headers={}){return Response.json(data,{status,headers:{"cache-control":"no-store","content-type":"application/json; charset=utf-8","x-content-type-options":"nosniff",...headers}})}
+function cors(request,env){const origin=request.headers.get("origin");const allowed=env.ALLOWED_ORIGIN||"*";return {"access-control-allow-origin":allowed==="*"?"*":origin===allowed?allowed:"null","access-control-allow-methods":"GET, POST, OPTIONS","access-control-allow-headers":"content-type, authorization, x-vault-token","access-control-max-age":"86400",vary:"Origin"}}
+function compute(){const topFive=DATA.topDepartments.slice(0,5);const topFiveTotal=topFive.reduce((sum,item)=>sum+item.loans,0);const latest=DATA.tgaSeriesRecent.at(-1);const previous=DATA.tgaSeriesRecent.at(-2);return {...DATA.summary,topFiveTotal,topFiveShare:topFiveTotal/DATA.summary.loanReceivables,latestTgaClosing:latest.closing,latestTgaOpening:latest.opening,latestTgaChange:latest.closing-previous.closing,topDepartments:DATA.topDepartments,tgaSeriesRecent:DATA.tgaSeriesRecent}}
+function nav(active){return [["/","Home"],["/overview","Overview"],["/treasury","Treasury"],["/departments","Departments"],["/insights","Insights"],["/?vault=hardware","Hardware Vault"]].map(([href,label])=>`<a class="${active===href?"active":""}" href="${href}">${label}</a>`).join("")}
+function card(label,value,sub){return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`}
+function shell(title,eyebrow,intro,active,body){return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${STYLE}</style></head><body><div class="wrap"><div class="hero"><div class="row"><strong>Wealth Worker</strong><span class="label">${esc(eyebrow)}</span></div><h1>${esc(title)}</h1><p class="muted">${esc(intro)}</p><div class="nav">${nav(active)}</div></div>${body}<div class="footer">Routes: <code>/api/health</code>, <code>/api/summary</code>, <code>/api/departments</code>, <code>/api/tga</code>, <code>/routes</code></div></div></body></html>`}
+function home(p){return shell("Wealth Worker — Home","Finance dashboard","A multi-page edge dashboard for Treasury and lending analytics.","/",`<div class="grid">${card("Loan receivables",compact(p.loanReceivables),"Principal outstanding")}${card("Interest receivable",compact(p.interestReceivable),"Earned but not yet collected")}${card("Interest revenue",compact(p.interestRevenue),"Revenue recognized in the ledger")}${card("Net gain / loss",compact(p.netGainLoss),p.netGainLoss<0?"Negative for the period":"Positive for the period")}</div><div class="section two"><div class="panel"><div class="label">Quick read</div><p class="muted">The top five departments account for ${(p.topFiveShare*100).toFixed(1)}% of loan receivables.</p><p class="muted">Treasury closed at ${fmt(p.latestTgaClosing)} in the latest reading.</p></div><div class="panel vault"><div class="label">Monetizable asset layer</div><h2>Hardware & Architecture Vault</h2><p class="muted">A premium catalog for technical artifacts, engineering studies, digital-twin material, and enterprise documentation.</p><a class="cta" href="/?vault=hardware">Open Hardware Vault</a></div></div>`)}
+function overview(p){return shell("Wealth Worker — Overview","Portfolio overview","Receivables, revenue, gain/loss, and concentration in one view.","/overview",`<div class="grid">${card("Loan receivables",compact(p.loanReceivables),"Total principal outstanding")}${card("Capitalized interest",compact(p.capitalizedInterestReceivable),"Capitalized interest receivable")}${card("Interest revenue",compact(p.interestRevenue),"Recognized revenue")}${card("Net gain / loss",compact(p.netGainLoss),"Period result")}</div><div class="section two"><div class="panel"><div class="label">Concentration</div><p class="muted">Top five departments hold ${(p.topFiveShare*100).toFixed(1)}% of loan receivables.</p><p class="muted">Top-five loan total: ${fmt(p.topFiveTotal)}</p></div><div class="panel"><div class="label">Spread</div><p class="muted">Interest revenue exceeds loss amount by ${fmt(p.interestRevenue-p.lossAmount)}</p></div></div>`)}
+function treasury(p){const rows=p.tgaSeriesRecent.map(r=>`<tr><td>${esc(r.date)}</td><td>${fmt(r.opening)}</td><td>${fmt(r.deposits)}</td><td>${fmt(r.withdrawals)}</td><td>${fmt(r.closing)}</td></tr>`).join("");return shell("Wealth Worker — Treasury","Treasury cash trend","Recent Treasury cash movements and closing balances.","/treasury",`<div class="section panel"><table class="table"><thead><tr><th>Date</th><th>Opening</th><th>Deposits</th><th>Withdrawals</th><th>Closing</th></tr></thead><tbody>${rows}</tbody></table></div><div class="section grid">${card("High",fmt(p.tgaHigh),"Highest observed close")}${card("Low",fmt(p.tgaLow),"Lowest observed close")}${card("Average",fmt(p.tgaAverage),"Average closing balance")}${card("Latest move",fmt(p.latestTgaChange),"Change from prior close")}</div>`)}
+function departments(p){const rows=p.topDepartments.map((r,i)=>`<tr><td>${i+1}</td><td>${esc(r.dept)}</td><td>${fmt(r.loans)}</td><td>${fmt(r.interestRevenue)}</td><td>${fmt(r.interestReceivable)}</td></tr>`).join("");return shell("Wealth Worker — Departments","Department concentration","The departments driving most of the ledger activity.","/departments",`<div class="section panel"><table class="table"><thead><tr><th>Rank</th><th>Department</th><th>Loan receivables</th><th>Interest revenue</th><th>Interest receivable</th></tr></thead><tbody>${rows}</tbody></table></div>`)}
+function insights(){return shell("Wealth Worker — Insights","Analysis and notes","Plain-English takeaways from the embedded data.","/insights",`<div class="section two"><div class="panel"><p><strong>Concentration risk</strong><br><span class="muted">Department 091 dominates the portfolio, and the top five departments are the clear center of gravity.</span></p><p><strong>Treasury movement</strong><br><span class="muted">The TGA series shows regular swings, including late-period inflows and outflows.</span></p></div><div class="panel"><p><strong>Revenue profile</strong><br><span class="muted">Interest revenue is large relative to the reported loss amount, even though net gain/loss remains negative.</span></p><p><strong>Monetization path</strong><br><span class="muted">The same edge application can expose premium research, technical artifacts, and enterprise access without replacing the existing dashboard.</span></p></div></div>`)}
+function hardwareVault(){const rows=HARDWARE_CATALOG.map((x)=>`<tr><td><strong>${esc(x.name)}</strong><br><span class="muted">${esc(x.id)}</span></td><td>${esc(x.category)}</td><td>${esc(x.status)}</td><td><span class="badge">${esc(x.access)}</span></td></tr>`).join("");return shell("Hardware & Architecture Vault","Premium asset catalog","Enterprise technical artifacts packaged as a monetizable access layer. Access control is currently a deployment-stage gate; connect a payment/identity provider before treating it as production commerce.","/?vault=hardware",`<div class="section panel vault"><div class="row"><span class="badge">ENTERPRISE</span><span class="muted">7 cataloged artifacts</span></div><h2>VO / Sovereign Technical Library</h2><p class="muted">Cataloged materials include engineering baselines, digital-twin studies, FEA execution, modular BOMs, deep-dive memos, and architecture studies.</p><table class="table"><thead><tr><th>Artifact</th><th>Category</th><th>Status</th><th>Access tier</th></tr></thead><tbody>${rows}</tbody></table></div><div class="section grid">${card("Catalog size",HARDWARE_CATALOG.length,"Current premium artifacts")}${card("Access model","Enterprise","Current stage")}${card("Commerce","Not connected","Payment provider required")}${card("Delivery","Edge vault","Cloudflare Worker")}</div>`)}
+function render(path,p){if(path==="/")return home(p);if(path==="/overview")return overview(p);if(path==="/treasury")return treasury(p);if(path==="/departments")return departments(p);if(path==="/insights")return insights(p);return null}
+function vaultAuthorized(request,env,url){const expected=env.VAULT_TOKEN;const supplied=request.headers.get("x-vault-token")||url.searchParams.get("token");return Boolean(expected&&supplied&&supplied===expected)}
+export default {async fetch(request,env){const requestId=rid(request);const c=cors(request,env);const url=new URL(request.url);const p=compute();if(request.method==="OPTIONS")return new Response(null,{status:204,headers:c});try{if(request.method==="GET"&&url.pathname==="/"&&url.searchParams.get("vault")==="hardware"){if(!vaultAuthorized(request,env))return new Response(shell("Hardware Vault — Access Required","Enterprise vault","This technical asset library requires an access credential. The credential should be provisioned as the Cloudflare Worker secret VAULT_TOKEN.","/?vault=hardware",`<div class="section panel vault"><h2>Access required</h2><p class="muted">Enter your authorized vault credential through the approved access flow. Do not publish the token in client-side code.</p><p class="muted">Catalog endpoint: <code>/routes?catalog=hardware</code></p></div>`),{status:401,headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store","www-authenticate":"Bearer"}});return new Response(hardwareVault(),{status:200,headers:{"content-type":"text/html; charset=utf-8","cache-control":"private, no-store","x-content-type-options":"nosniff"}})}if(request.method==="GET"&&url.pathname==="/routes"&&url.searchParams.get("catalog")==="hardware"){if(!vaultAuthorized(request,env))return json({error:"Vault access required",code:"VAULT_UNAUTHORIZED",request_id:requestId},401,{...c,"www-authenticate":"Bearer"});return json({request_id:requestId,catalog:"hardware",artifacts:HARDWARE_CATALOG},200,c)}if(request.method==="GET"&&["/","/overview","/treasury","/departments","/insights"].includes(url.pathname))return new Response(render(url.pathname,p),{status:200,headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store","x-content-type-options":"nosniff"}});if(request.method==="GET"&&url.pathname==="/api/health")return json({ok:true,service:"wealth-worker",request_id:requestId},200,c);if(request.method==="GET"&&url.pathname==="/api/summary")return json({request_id:requestId,...p,topDepartments:undefined,tgaSeriesRecent:undefined},200,c);if(request.method==="GET"&&url.pathname==="/api/departments")return json({request_id:requestId,departments:p.topDepartments},200,c);if(request.method==="GET"&&url.pathname==="/api/tga")return json({request_id:requestId,series:p.tgaSeriesRecent},200,c);if(request.method==="GET"&&url.pathname==="/routes")return json({request_id:requestId,routes:ROUTES},200,c);return json({error:"Not found",code:"NOT_FOUND",request_id:requestId},404,c)}catch(error){console.error(JSON.stringify({event:"unhandled_error",request_id:requestId,message:error instanceof Error?error.message:"Unknown error"}));return json({error:"Internal server error",code:"INTERNAL_ERROR",request_id:requestId},500,c)}}};
