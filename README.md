@@ -18,7 +18,14 @@ The app is live on Cloudflare at:
 ## Analytics and monitoring
 
 - Cloudflare Web Analytics is enabled for the zone
-- The app exposes `/api/health` for uptime checks and monitoring
+- A Cloudflare health check monitors `https://knockoutforever.com/api/health`
+- The app also exposes `/api/health` for simple uptime checks
+
+## Hardware vault
+
+- Open the vault mode at `https://knockoutforever.com/?vault=hardware`
+- Send the access token as the `token` query parameter or the `x-vault-token` header
+- Query the hardware catalog as JSON at `https://knockoutforever.com/routes?catalog=hardware`
 
 ## Pages
 
