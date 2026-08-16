@@ -1,6 +1,6 @@
 # Wealth Worker
 
-A full multi-page Cloudflare Worker app built from the uploaded treasury and loan ledger files.
+A full multi-page Cloudflare Worker app built from the uploaded treasury and loan ledger files, now extended with a monetizable technical-asset vault.
 
 ## Live site
 
@@ -13,7 +13,7 @@ The app is live on Cloudflare at:
 ## Branding
 
 - Custom Wealth Worker favicon
-- Simple branded header treatment in the app shell
+- Branded header treatment in the app shell
 
 ## Analytics and monitoring
 
@@ -23,9 +23,12 @@ The app is live on Cloudflare at:
 
 ## Hardware vault
 
-- Open the vault mode at `https://knockoutforever.com/?vault=hardware`
-- Send the access token as the `token` query parameter or the `x-vault-token` header
-- Query the hardware catalog as JSON at `https://knockoutforever.com/routes?catalog=hardware`
+- Browser entry point: `/?vault=hardware`
+- JSON catalog: `/routes?catalog=hardware`
+- Production access is controlled by the Worker secret `VAULT_TOKEN`
+- The token may be supplied through the `x-vault-token` header or an authorized server-side access flow
+- Do not put the production token in public links, source code, client-side JavaScript, or documentation
+- Current vault is a catalog/access layer; payment and identity/checkout are not yet connected
 
 ## Pages
 
@@ -34,6 +37,7 @@ The app is live on Cloudflare at:
 - `/treasury` — Treasury General Account trend
 - `/departments` — concentration analysis
 - `/insights` — narrative analysis and build notes
+- `/?vault=hardware` — enterprise hardware and architecture vault
 
 ## JSON routes
 
@@ -42,7 +46,7 @@ The app is live on Cloudflare at:
 - `/api/departments`
 - `/api/tga`
 - `/routes`
-- `/favicon.svg`
+- `/routes?catalog=hardware`
 
 ## What it does
 
@@ -50,7 +54,8 @@ The app is live on Cloudflare at:
 - Embeds the supplied CSV data directly into the worker
 - Shows headline wealth metrics, department concentration, and treasury movement
 - Provides JSON endpoints for programmatic access
-- Serves a branded favicon and canonical www-to-apex redirect
+- Provides a gated catalog for technical artifacts and enterprise research
+- Keeps the existing dashboard intact while adding a premium asset layer
 
 ## Run locally
 
@@ -63,4 +68,10 @@ npm run dev
 
 ```bash
 npm run deploy
+```
+
+Before production vault access is enabled, configure the secret:
+
+```bash
+wrangler secret put VAULT_TOKEN
 ```
