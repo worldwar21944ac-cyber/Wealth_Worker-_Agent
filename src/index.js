@@ -300,7 +300,7 @@ function insights() {
     "Analysis and notes",
     "Plain-English takeaways from the embedded data.",
     "/insights",
-    `<div class="section two"><div class="panel"><p><strong>Concentration risk</strong><br><span class="muted">Department 091 dominates the portfolio, and the top five departments are the clear center of gravity.</span></p><p><strong>Treasury movement</strong><br><span class="muted">The TGA series shows regular swings, including late-period inflows and outflows.</span></p></div><div class="panel"><p><strong>Revenue profile</strong><br><span class="muted">Interest revenue is large relative to the reported loss amount, even though net gain/loss remains negative.</span></p><p><strong>Monetization path</strong><br><span class="muted">The same edge application can expose premium research, technical artifacts, and enterprise access without replacing the existing dashboard.</span></p></div></div>`,
+    `<div class="section two"><div class="panel"><p><strong>Concentration risk</strong><br><span class="muted">Department 091 dominates the portfolio, and the top five departments are the clear center of gravity.</span></p><p><strong>Treasury movement</strong><br><span class="muted">The TGA series shows regular swings, including late-period inflows and outflows.</span></p></div><div class="panel"><p><strong>Revenue profile</strong><br><span class="muted">Interest revenue is large relative to the reported loss amount, even though net gain/loss remains negative.</span></p><p><strong>App shape</strong><br><span class="muted">The worker serves multiple pages plus JSON routes for dashboard and API use.</span></p></div></div>`,
   );
 }
 
