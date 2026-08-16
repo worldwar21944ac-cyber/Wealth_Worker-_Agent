@@ -225,7 +225,7 @@ function catalogResponse(category, unlocked) {
 function vaultLanding() {
   const previews = HARDWARE_ASSETS.map((asset) => assetCard(asset, false)).join("");
   return shell(
-    "Wealth Worker  Hardware Vault",
+    "Wealth Worker — Hardware Vault",
     "Secure assets",
     "Enter the access token to open the first enterprise asset pack.",
     "/?vault=hardware",
@@ -236,7 +236,7 @@ function vaultLanding() {
 function vaultViewer() {
   const unlocked = HARDWARE_ASSETS.map((asset) => assetCard(asset, true)).join("");
   return shell(
-    "Wealth Worker  Hardware Vault",
+    "Wealth Worker — Hardware Vault",
     "Enterprise access",
     "Token verified. The first asset pack is live.",
     "/?vault=hardware",
@@ -250,7 +250,7 @@ function shell(title, eyebrow, intro, active, body) {
 
 function home(p) {
   return shell(
-    "Wealth Worker  Home",
+    "Wealth Worker — Home",
     "Finance dashboard",
     "A multi-page edge dashboard for Treasury and lending analytics.",
     "/",
@@ -260,7 +260,7 @@ function home(p) {
 
 function overview(p) {
   return shell(
-    "Wealth Worker  Overview",
+    "Wealth Worker — Overview",
     "Portfolio overview",
     "Receivables, revenue, gain/loss, and concentration in one view.",
     "/overview",
@@ -273,7 +273,7 @@ function treasury(p) {
     .map((r) => `<tr><td>${esc(r.date)}</td><td>${fmt(r.opening)}</td><td>${fmt(r.deposits)}</td><td>${fmt(r.withdrawals)}</td><td>${fmt(r.closing)}</td></tr>`)
     .join("");
   return shell(
-    "Wealth Worker  Treasury",
+    "Wealth Worker — Treasury",
     "Treasury cash trend",
     "Recent Treasury cash movements and closing balances.",
     "/treasury",
@@ -286,7 +286,7 @@ function departments(p) {
     .map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.dept)}</td><td>${fmt(r.loans)}</td><td>${fmt(r.interestRevenue)}</td><td>${fmt(r.interestReceivable)}</td></tr>`)
     .join("");
   return shell(
-    "Wealth Worker  Departments",
+    "Wealth Worker — Departments",
     "Department concentration",
     "The departments driving most of the ledger activity.",
     "/departments",
@@ -296,7 +296,7 @@ function departments(p) {
 
 function insights() {
   return shell(
-    "Wealth Worker  Insights",
+    "Wealth Worker — Insights",
     "Analysis and notes",
     "Plain-English takeaways from the embedded data.",
     "/insights",
@@ -333,7 +333,7 @@ export default {
         if (!vaultAuthorized(request, env, url)) {
           return new Response(
             shell(
-              "Hardware Vault  Access Required",
+              "Hardware Vault — Access Required",
               "Enterprise vault",
               "This technical asset library requires an access credential. The credential should be provisioned as the Cloudflare Worker secret VAULT_TOKEN.",
               "/?vault=hardware",
