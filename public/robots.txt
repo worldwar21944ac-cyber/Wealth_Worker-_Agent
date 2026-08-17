@@ -1,0 +1,21 @@
+User-agent: *
+Allow: /
+Allow: /crawlers.json
+Allow: /sitemap.xml
+
+# Commercially gated technical content for AI crawlers.
+User-agent: GPTBot
+Disallow: /vault/
+Disallow: /assets/protected/
+
+User-agent: ClaudeBot
+Disallow: /vault/
+Disallow: /assets/protected/
+
+User-agent: Bytespider
+Disallow: /vault/
+Disallow: /assets/protected/
+
+User-agent: CCBot
+Disallow: /vault/
+Disallow: /assets/protected/
