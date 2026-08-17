@@ -1,0 +1,30 @@
+{
+  "version": "1.0",
+  "domain": "knockoutforever.com",
+  "pricing": {
+    "currency": "USD",
+    "default_price_per_request": 2.5,
+    "routes": [
+      {
+        "path": "/api/tga",
+        "price_per_request": 0.5,
+        "description": "Daily Treasury Statement feed"
+      },
+      {
+        "path": "/api/summary",
+        "price_per_request": 1.0,
+        "description": "Consolidated wealth-worker summary data"
+      },
+      {
+        "path": "/vault/*",
+        "price_per_request": 5.0,
+        "description": "Proprietary technical-asset vault"
+      }
+    ]
+  },
+  "protocols_supported": [
+    "Cloudflare-PayPerCrawl",
+    "ACP-Delegate-Payment"
+  ],
+  "contact": "admin@knockoutforever.com"
+}
