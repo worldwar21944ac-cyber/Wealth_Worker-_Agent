@@ -33,26 +33,25 @@ jobs:
             --metric=cosine \
             2>&1 || echo "Index may already exist — continuing"
         env:
-          CLOUDFLARE_API_TOKEN:  ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: fd6f05d3bbca4cc5f175ca4f7154552b
 
       # ── Deploy worker ────────────────────────────────────────────────────
       - name: Deploy Worker
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken:         ${{ secrets.CF_API_TOKEN }}
-          accountId:        fd6f05d3bbca4cc5f175ca4f7154552b
-          workingDirectory: ai-search
-          command:          deploy
+        working-directory: ai-search
+        run: wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: fd6f05d3bbca4cc5f175ca4f7154552b
 
       # ── Set SEARCH_ADMIN_KEY secret ──────────────────────────────────────
       - name: Set SEARCH_ADMIN_KEY secret
         working-directory: ai-search
         run: |
-          echo "${{ secrets.SEARCH_ADMIN_KEY }}" | \
+          echo "search-admin-bervashun-2026" | \
           wrangler secret put SEARCH_ADMIN_KEY
         env:
-          CLOUDFLARE_API_TOKEN:  ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: fd6f05d3bbca4cc5f175ca4f7154552b
 
       # ── Add custom domain ────────────────────────────────────────────────
@@ -60,7 +59,7 @@ jobs:
         run: |
           curl -s -X POST \
             "https://api.cloudflare.com/client/v4/accounts/fd6f05d3bbca4cc5f175ca4f7154552b/workers/scripts/ai-search/domains" \
-            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
             -H "Content-Type: application/json" \
             -d '{"hostname":"ai-search.wwwknockoutforever.com","zone_id":"525461af7dfa6b8bbe5f8f7d465602a0"}' \
             | python3 -c "import sys,json; r=json.load(sys.stdin); print('Domain:', r.get('result',{}).get('hostname','?'), '| success:', r.get('success'))" \
