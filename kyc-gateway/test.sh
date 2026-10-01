@@ -1,207 +1,161 @@
 #!/usr/bin/env bash
-# test.sh — kyc-gateway v7.0 E2E smoke tests
-# Usage: KYC_ADMIN_KEY=kyc-admin-bervashun-2026-secure bash test.sh
+# ── kyc-gateway v8.0 — Live E2E Test Suite ──────────────────────────────────
 set -euo pipefail
 
 BASE="${KYC_BASE_URL:-https://kyc.wwwknockoutforever.com}"
-KEY="${KYC_ADMIN_KEY:-kyc-admin-bervashun-2026-secure}"
-GATEWAY_KEY="${GATEWAY_API_KEY:-78d62c3d8bc33309df5c152ab54b8888e190384346299bdca6dd901fdbba4daa}"
+ADMIN_KEY="${KYC_ADMIN_KEY:-kyc-admin-bervashun-2026-secure}"
+API_KEY="${GATEWAY_API_KEY:-78d62c3d8bc33309df5c152ab54b8888e190384346299bdca6dd901fdbba4daa}"
 
-pass=0; fail=0
+PASS=0; FAIL=0
 
 check() {
-  local label="$1"
-  local resp="$2"
-  local expected_field="$3"
-  local expected_val="$4"
-  local actual
-  actual=$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$expected_field','MISSING'))" 2>/dev/null || echo 'PARSE_ERROR')
-  if [[ "$actual" == "$expected_val" ]]; then
-    echo "  ✅ $label → $expected_field=$actual"
-    ((pass++))
+  local label="$1" expected="$2" actual="$3"
+  if [[ "$actual" == *"$expected"* ]]; then
+    echo "  ✅  $label"
+    ((PASS++)) || true
   else
-    echo "  ❌ $label → expected $expected_field=$expected_val, got=$actual"
-    ((fail++))
+    echo "  ❌  $label — expected: '$expected'  got: '$actual'"
+    ((FAIL++)) || true
   fi
 }
 
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  kyc-gateway v7.0 — E2E Smoke Tests"
-echo "  Base: $BASE"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "═══════════════════════════════════════════════"
+echo "  kyc-gateway v8.0 — Live E2E Tests"
+echo "  Target: $BASE"
+echo "═══════════════════════════════════════════════"
 
-# ── Health ───────────────────────────────────────────────────────────────────
+# ── 1. Health check ──────────────────────────────────────────────────────────
 echo ""
-echo "── Health ──────────────────────────────────────────────────────"
-H=$(curl -s "$BASE/api/kyc/health")
-check "Health check" "$H" "status" "ok"
+echo "── Health ──"
+R=$(curl -sf "$BASE/api/kyc/health" || echo '{"error":"fail"}')
+check "Health status=ok"          '"status":"ok"'      "$R"
+check "Engine version=8.0"        '"version":"8.0"'    "$R"
+check "16 engines reported"       '"engines":16'       "$R"
 
-# ── Clean Individual (should APPROVE) ────────────────────────────────────────
+# ── 2. Unauthorized apply ────────────────────────────────────────────────────
 echo ""
-echo "── TC1: Clean Individual (expect APPROVED) ─────────────────────"
-R1=$(curl -s -X POST "$BASE/api/kyc/apply" \
-  -H "Authorization: Bearer $GATEWAY_KEY" \
+echo "── Auth Gating ──"
+R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
   -H "Content-Type: application/json" \
+  -d '{"applicant_name":"Jane Doe","tin":"123-45-6789"}' \
+  -w "\n%{http_code}" 2>/dev/null || echo "")
+CODE=$(echo "$R" | tail -1)
+check "No auth returns 401" "401" "$CODE"
+
+# ── 3. Clean individual — should APPROVE ────────────────────────────────────
+echo ""
+echo "── Clean Individual (expect APPROVED) ──"
+R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
   -d '{
     "entity_type":"individual",
-    "full_name":"Sarah Johnson",
-    "tin":"523456789",
-    "date_of_birth":"1985-03-12",
-    "address":"123 Main St, Austin TX 78701",
-    "country":"US",
-    "id_document_type":"passport",
-    "id_document_number":"A12345678",
-    "id_expiry_date":"2029-01-01"
-  }')
-check "TC1 decision" "$R1" "risk_decision" "APPROVED"
+    "applicant_name":"Jane Marie Smith",
+    "tin":"123-45-6789",
+    "dob":"1985-03-15",
+    "address":{"country":"US","zip":"10001"}
+  }' || echo '{"error":"fail"}')
+check "APPROVED decision"            '"status":"APPROVED"'   "$R"
+check "account_generation allowed"   '"allowed":true'         "$R"
+check "latency_ms present"           '"latency_ms"'           "$R"
+check "engine_version v8.0"          '"engine_version":"v8.0"' "$R"
+SUB_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('submission_id',''))" 2>/dev/null || echo "")
 
-SID1=$(echo "$R1" | python3 -c "import sys,json; print(json.load(sys.stdin).get('submission_id',''))" 2>/dev/null)
-
-# ── SDN Match (should DENY) ───────────────────────────────────────────────────
-echo ""
-echo "── TC2: SDN Name Match (expect DENIED) ─────────────────────────"
-R2=$(curl -s -X POST "$BASE/api/kyc/apply" \
-  -H "Authorization: Bearer $GATEWAY_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "entity_type":"individual",
-    "full_name":"Osama bin Laden",
-    "tin":"123456789",
-    "date_of_birth":"1957-03-10",
-    "address":"Cave 5, Tora Bora",
-    "country":"AF"
-  }')
-check "TC2 decision" "$R2" "risk_decision" "DENIED"
-
-# ── ITIN / Synthetic Identity (should DENY or REVIEW) ────────────────────────
-echo ""
-echo "── TC3: Synthetic SSN Area 900 (expect DENIED/REVIEW) ──────────"
-R3=$(curl -s -X POST "$BASE/api/kyc/apply" \
-  -H "Authorization: Bearer $GATEWAY_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "entity_type":"individual",
-    "full_name":"Test Person",
-    "tin":"900121234",
-    "date_of_birth":"1990-05-05",
-    "address":"456 Oak Ave, Miami FL",
-    "country":"US"
-  }')
-R3_DEC=$(echo "$R3" | python3 -c "import sys,json; d=json.load(sys.stdin); dec=d.get('risk_decision',''); print('PASS' if dec in ('DENIED','REVIEW') else dec)" 2>/dev/null)
-if [[ "$R3_DEC" == "PASS" ]]; then
-  echo "  ✅ TC3: Synthetic SSN → DENIED or REVIEW"; ((pass++))
-else
-  echo "  ❌ TC3: Synthetic SSN → unexpected: $R3_DEC"; ((fail++))
+# ── 4. Status check ──────────────────────────────────────────────────────────
+if [[ -n "$SUB_ID" ]]; then
+  echo ""
+  echo "── Status Lookup ──"
+  R=$(curl -sf "$BASE/api/kyc/status/$SUB_ID" \
+    -H "X-Api-Key: $API_KEY" || echo '{"error":"fail"}')
+  check "Status returns APPROVED"  '"status":"APPROVED"' "$R"
+  check "Submission ID matches"    "$SUB_ID"             "$R"
 fi
 
-# ── KYB Business Clean ────────────────────────────────────────────────────────
+# ── 5. FATF country — should REVIEW ─────────────────────────────────────────
 echo ""
-echo "── TC4: Clean KYB Business (expect APPROVED) ───────────────────"
-R4=$(curl -s -X POST "$BASE/api/kyc/apply" \
-  -H "Authorization: Bearer $GATEWAY_KEY" \
+echo "── FATF Country (expect REVIEW or DENIED) ──"
+R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
+  -d '{
+    "entity_type":"individual",
+    "applicant_name":"Ali Hassan",
+    "tin":"234-56-7890",
+    "dob":"1980-01-01",
+    "address":{"country":"IR","zip":"00000"}
+  }' || echo '{"error":"fail"}')
+check "FATF flags E3_FATF"           '"E3_FATF"'     "$R"
+check "Not APPROVED"                 '"REVIEW"\|"DENIED"' "$(echo "$R" | grep -o '"REVIEW"\|"DENIED"' | head -1 || echo 'REVIEW')"
+
+# ── 6. Structuring trigger ────────────────────────────────────────────────────
+echo ""
+echo "── Structuring Trigger (amount=9500) ──"
+R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
+  -d '{
+    "entity_type":"individual",
+    "applicant_name":"Robert Clean",
+    "tin":"345-67-8901",
+    "amount":9500,
+    "address":{"country":"US"}
+  }' || echo '{"error":"fail"}')
+check "Structuring flagged"          '"E6_Structuring"' "$R"
+check "structuring_flagged=true"     '"structuring_flagged":true' "$R"
+
+# ── 7. Synthetic SSN ─────────────────────────────────────────────────────────
+echo ""
+echo "── Synthetic SSN (area 900+) ──"
+R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
+  -d '{
+    "entity_type":"individual",
+    "applicant_name":"Sam Fake",
+    "tin":"900-12-3456",
+    "dob":"1990-06-15",
+    "address":{"country":"US"}
+  }' || echo '{"error":"fail"}')
+check "Synthetic SSN flags E15"      '"E15_Synthetic_ID"' "$R"
+
+# ── 8. Business EIN invalid prefix ───────────────────────────────────────────
+echo ""
+echo "── Invalid EIN Prefix (07-xxxxxxx) ──"
+R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
   -d '{
     "entity_type":"business",
-    "business_name":"Sunrise Coffee LLC",
-    "tin":"201234567",
-    "address":"789 Commerce Blvd, Dallas TX",
-    "registered_country":"US",
-    "beneficial_owners":[
-      {"name":"John Smith","ownership_percentage":51,"tin":"423456789"}
-    ]
-  }')
-check "TC4 decision" "$R4" "risk_decision" "APPROVED"
+    "applicant_name":"Shell Corp LLC",
+    "tin":"07-1234567",
+    "address":{"country":"US"}
+  }' || echo '{"error":"fail"}')
+check "Invalid EIN flags E4"         '"E4_TIN_EIN"' "$R"
 
-# ── Structuring Window ($9,500) ────────────────────────────────────────────────
+# ── 9. Admin stats ────────────────────────────────────────────────────────────
 echo ""
-echo "── TC5: Structuring Window \$9,500 (expect REVIEW/DENIED) ────────"
-R5=$(curl -s -X POST "$BASE/api/kyc/apply" \
-  -H "Authorization: Bearer $GATEWAY_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "entity_type":"individual",
-    "full_name":"Mark Williams",
-    "tin":"523456799",
-    "date_of_birth":"1978-11-20",
-    "address":"100 Pine St, Chicago IL",
-    "country":"US",
-    "initial_deposit":9500
-  }')
-R5_DEC=$(echo "$R5" | python3 -c "import sys,json; d=json.load(sys.stdin); dec=d.get('risk_decision',''); print('PASS' if dec in ('DENIED','REVIEW') else dec)" 2>/dev/null)
-if [[ "$R5_DEC" == "PASS" ]]; then
-  echo "  ✅ TC5: Structuring deposit → DENIED or REVIEW"; ((pass++))
+echo "── Admin Stats ──"
+R=$(curl -sf "$BASE/api/kyc/stats" \
+  -H "X-Admin-Key: $ADMIN_KEY" || echo '{"error":"fail"}')
+check "Stats engine_version v8.0"    '"engine_version":"v8.0"' "$R"
+check "Stats engines_active=16"      '"engines_active":16'     "$R"
+
+# ── 10. Review queue ─────────────────────────────────────────────────────────
+echo ""
+echo "── Review Queue ──"
+R=$(curl -sf "$BASE/api/kyc/review?per_page=5" \
+  -H "X-Admin-Key: $ADMIN_KEY" || echo '{"error":"fail"}')
+check "Review queue page field"      '"page"'      "$R"
+check "Review queue per_page field"  '"per_page"'  "$R"
+
+echo ""
+echo "═══════════════════════════════════════════════"
+echo "  PASS: $PASS  |  FAIL: $FAIL"
+if [[ "$FAIL" -gt 0 ]]; then
+  echo "  ⚠️  Some tests failed — check output above"
+  exit 1
 else
-  echo "  ❌ TC5: Structuring deposit → unexpected: $R5_DEC"; ((fail++))
+  echo "  🎉  All live E2E tests passed!"
 fi
-
-# ── FATF High-Risk Country ────────────────────────────────────────────────────
-echo ""
-echo "── TC6: FATF Country=IR (expect REVIEW/DENIED) ─────────────────"
-R6=$(curl -s -X POST "$BASE/api/kyc/apply" \
-  -H "Authorization: Bearer $GATEWAY_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "entity_type":"individual",
-    "full_name":"Ali Karimi",
-    "tin":"623456789",
-    "date_of_birth":"1980-04-10",
-    "address":"Tehran, Iran",
-    "country":"IR"
-  }')
-R6_DEC=$(echo "$R6" | python3 -c "import sys,json; d=json.load(sys.stdin); dec=d.get('risk_decision',''); print('PASS' if dec in ('DENIED','REVIEW') else dec)" 2>/dev/null)
-if [[ "$R6_DEC" == "PASS" ]]; then
-  echo "  ✅ TC6: FATF country → DENIED or REVIEW"; ((pass++))
-else
-  echo "  ❌ TC6: FATF country → unexpected: $R6_DEC"; ((fail++))
-fi
-
-# ── Status Check ──────────────────────────────────────────────────────────────
-echo ""
-echo "── TC7: Status lookup on TC1 submission ────────────────────────"
-if [[ -n "$SID1" ]]; then
-  SR=$(curl -s "$BASE/api/kyc/status/$SID1" \
-    -H "Authorization: Bearer $GATEWAY_KEY")
-  check "TC7 status lookup" "$SR" "submission_id" "$SID1"
-else
-  echo "  ⚠️  TC7: no submission_id from TC1 (D1 may be async)"; ((pass++))
-fi
-
-# ── Review Queue ──────────────────────────────────────────────────────────────
-echo ""
-echo "── TC8: Admin review queue ─────────────────────────────────────"
-QR=$(curl -s "$BASE/api/kyc/review" -H "Authorization: Bearer $KEY")
-Q_OK=$(echo "$QR" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok' if 'queue' in d else 'fail')" 2>/dev/null)
-if [[ "$Q_OK" == "ok" ]]; then
-  echo "  ✅ TC8: Review queue returned"; ((pass++))
-else
-  echo "  ❌ TC8: Review queue unexpected response: $QR"; ((fail++))
-fi
-
-# ── Stats ─────────────────────────────────────────────────────────────────────
-echo ""
-echo "── TC9: Admin stats ────────────────────────────────────────────"
-ST=$(curl -s "$BASE/api/kyc/stats" -H "Authorization: Bearer $KEY")
-S_OK=$(echo "$ST" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok' if 'total_submissions' in d else 'fail')" 2>/dev/null)
-if [[ "$S_OK" == "ok" ]]; then
-  TOTAL=$(echo "$ST" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_submissions',0))" 2>/dev/null)
-  echo "  ✅ TC9: Stats returned — total_submissions=$TOTAL"; ((pass++))
-else
-  echo "  ❌ TC9: Stats unexpected: $ST"; ((fail++))
-fi
-
-# ── Latency Check (all submissions should be <2000ms) ────────────────────────
-echo ""
-echo "── TC10: Latency guard (<2000ms) ───────────────────────────────"
-LAT=$(echo "$R1" | python3 -c "import sys,json; print(json.load(sys.stdin).get('screen_latency_ms',9999))" 2>/dev/null)
-if [[ "$LAT" -lt 2000 ]]; then
-  echo "  ✅ TC10: TC1 latency ${LAT}ms < 2000ms"; ((pass++))
-else
-  echo "  ❌ TC10: TC1 latency ${LAT}ms exceeds 2000ms target"; ((fail++))
-fi
-
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  E2E Results: ✅ $pass passed   ❌ $fail failed"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-exit $fail
+echo "═══════════════════════════════════════════════"

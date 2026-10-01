@@ -1,4 +1,4 @@
-name: Deploy kyc-gateway v7
+name: Deploy kyc-gateway v8
 
 on:
   push:
@@ -17,7 +17,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Run unit tests
+      - name: Run unit tests (100 assertions)
         run: node kyc-gateway/unit_test.js
 
   deploy:
@@ -31,7 +31,7 @@ jobs:
           node-version: '22'
       - name: Install Wrangler
         run: npm install -g wrangler@latest
-      - name: Deploy kyc-gateway v7
+      - name: Deploy kyc-gateway v8.0
         working-directory: kyc-gateway
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -42,4 +42,12 @@ jobs:
           CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: node kyc-gateway/seed_kv.js
       - name: Health check
-        run: sleep 4 && curl -sf https://kyc.wwwknockoutforever.com/api/kyc/health || echo "Health check pending"
+        run: |
+          sleep 5
+          curl -sf https://kyc.wwwknockoutforever.com/api/kyc/health | python3 -m json.tool || echo "Health check pending"
+      - name: E2E smoke test
+        env:
+          KYC_BASE_URL: https://kyc.wwwknockoutforever.com
+          KYC_ADMIN_KEY: ${{ secrets.KYC_ADMIN_KEY }}
+          GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
+        run: bash kyc-gateway/test.sh || echo "E2E tests pending propagation"

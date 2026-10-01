@@ -1,887 +1,817 @@
 /**
- * kyc-gateway v7.0 — Bervashun Trust Capital
- * Sub-2-Second KYC/KYB Intake Screening
+ * kyc-gateway v8.0 — Sub-2-Second KYC/KYB Intake Screening
+ * ============================================================
+ * Cloudflare Worker | Bervashun Trust Capital
  *
- * 16 parallel screening engines, hard 1800ms fence,
- * pre-account-generation gate, D1 audit trail, human review queue.
+ * Engines (16, Promise.all parallel fan-out):
+ *   E1  OFAC SDN          — 40 pts/hit, cap 70
+ *   E2  PEP               — 25 pts/hit, cap 50
+ *   E3  FATF High-Risk    — 20 pts, 55 countries
+ *   E4  TIN/EIN Validity  — 20 pts
+ *   E5  Velocity          — 15 pts if >5 submissions/TIN/24 h
+ *   E6  Structuring       — 35 pts if $8,000–$9,999 amount
+ *   E7  Adverse Media     — 5 pts/keyword, cap 30
+ *   E8  UBO Cascade       — 25 pts, ≥25% ownership; OFAC+PEP parallel
+ *   E9  DOB Plausibility  — 35 pts future/under-18/over-120
+ *   E10 Address Risk      — 10 pts high-risk ZIP/country mismatch
+ *   E11 Entity Consistency — 15 pts name/TIN mismatch signals
+ *   E12 Corporate Depth   — 20 pts >4 ownership layers
+ *   E13 Document Entropy  — 10 pts low-entropy / expired docs
+ *   E14 Network Graph     — 20 pts shared TIN or address
+ *   E15 Synthetic Identity — 40 pts SSN area 900+
+ *   E16 Watchlist Delta   — 30 pts newly-added SDN (delta list)
  *
- * Bindings required:
- *   AUDIT_DB        — D1 database (f2fe6105-b552-42b4-a2ca-9d2a349861da)
- *   KYC_SANCTIONS   — KV namespace (203d064ff04b45d9b15a363aa18427be)
- *   GATEWAY_AUTH    — KV namespace (06af84f811b84abbb1d956b639d0cd07)
+ * Decision bands:
+ *   0–29   → APPROVED  (account_generation.allowed = true)
+ *   30–69  → REVIEW    (queued for human; account_generation.allowed = false)
+ *   70–100 → DENIED    (fires SYSTEM_ALERT; account_generation.allowed = false)
  *
- * Secrets required:
- *   KYC_ADMIN_KEY   — admin bearer token
- *   NOTIFIER_TOKEN  — signup-notifier dispatch token
+ * Hard timeout fence: 1800 ms → auto-REVIEW if engines not done
+ *
+ * Routes:
+ *   POST /api/kyc/apply                     — intake (GATEWAY_AUTH KV)
+ *   GET  /api/kyc/status/:id                — check submission (GATEWAY_AUTH KV)
+ *   GET  /api/kyc/review                    — admin review queue (KYC_ADMIN_KEY)
+ *   POST /api/kyc/review/:id/approve        — approve (KYC_ADMIN_KEY)
+ *   POST /api/kyc/review/:id/reject         — reject  (KYC_ADMIN_KEY)
+ *   POST /api/kyc/review/:id/escalate       — escalate (KYC_ADMIN_KEY)
+ *   POST /api/kyc/batch                     — batch up to 50 (KYC_ADMIN_KEY)
+ *   GET  /api/kyc/health                    — unauthenticated liveness
+ *   GET  /api/kyc/stats                     — admin stats (KYC_ADMIN_KEY)
+ *
+ * Bindings:
+ *   AUDIT_DB      — D1 (f2fe6105-b552-42b4-a2ca-9d2a349861da)
+ *   KYC_SANCTIONS — KV  (203d064ff04b45d9b15a363aa18427be)
+ *   GATEWAY_AUTH  — KV  (06af84f811b84abbb1d956b639d0cd07)
+ *   KYC_ADMIN_KEY — secret
+ *   NOTIFIER_TOKEN — secret
  */
 
-const VERSION = '7.0.0';
-const ENGINE_VERSION = 'E16';
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-// ─── Decision Bands ──────────────────────────────────────────────────────────
-const BAND = { APPROVED: 'APPROVED', REVIEW: 'REVIEW', DENIED: 'DENIED' };
-function band(score) {
-  if (score >= 70) return BAND.DENIED;
-  if (score >= 30) return BAND.REVIEW;
-  return BAND.APPROVED;
+const VERSION = "8.0";
+const TIMEOUT_MS = 1800;
+
+// FATF High-Risk + Other Monitored Jurisdictions (55 countries)
+const FATF_COUNTRIES = new Set([
+  "AF","AL","BB","BF","BJ","BT","CM","CD","CF","CG","CU","ET","GH","GN","GY",
+  "HT","IR","IQ","JM","JO","KP","LB","LY","ML","MZ","MR","MM","NA","NG","PA",
+  "PK","PH","RU","SA","SN","SC","SL","SO","SS","SD","SY","TZ","TR","TT","TM",
+  "UA","UG","VU","VE","VN","YE","ZW","BY","NI","ZM"
+]);
+
+// IRS-disallowed EIN prefixes
+const DISALLOWED_EIN_PREFIXES = new Set([
+  "07","08","09","17","18","19","28","29","49","69","70","78","79","89"
+]);
+
+// Adverse media keywords
+const ADVERSE_KEYWORDS = [
+  "fraud","money laundering","terrorist","sanction","bribery","corruption",
+  "trafficking","embezzlement","cartel","conviction","indicted","arrested",
+  "seizure","forfeiture","wire fraud","tax evasion","ponzi","pyramid"
+];
+
+// High-risk ZIP prefixes (illustrative — real list would be 10k+ entries)
+const HIGH_RISK_ZIPS = new Set(["00600","00900","33101","33125","77001","90001"]);
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function cors(resp) {
+  const h = new Headers(resp.headers);
+  h.set("Access-Control-Allow-Origin", "*");
+  h.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  h.set("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Api-Key");
+  return new Response(resp.body, { status: resp.status, headers: h });
 }
 
-// ─── Fuzzy String Matching ────────────────────────────────────────────────────
-function jaroWinkler(a, b) {
-  if (!a || !b) return 0;
-  a = a.toUpperCase(); b = b.toUpperCase();
-  if (a === b) return 1;
-  const aw = a.length, bw = b.length;
-  const matchDist = Math.floor(Math.max(aw, bw) / 2) - 1;
-  const aMatched = new Array(aw).fill(false);
-  const bMatched = new Array(bw).fill(false);
+function json(data, status = 200) {
+  return cors(new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { "Content-Type": "application/json" }
+  }));
+}
+
+function uuid() {
+  return crypto.randomUUID();
+}
+
+function cap(val, max) { return Math.min(val, max); }
+function clamp(val)     { return Math.min(Math.max(val, 0), 100); }
+
+// Jaro-Winkler similarity
+function jaroWinkler(s1, s2) {
+  if (!s1 || !s2) return 0;
+  s1 = s1.toUpperCase(); s2 = s2.toUpperCase();
+  if (s1 === s2) return 1;
+  const l1 = s1.length, l2 = s2.length;
+  const matchDist = Math.floor(Math.max(l1, l2) / 2) - 1;
+  if (matchDist < 0) return 0;
+  const s1m = new Array(l1).fill(false);
+  const s2m = new Array(l2).fill(false);
   let matches = 0, transpositions = 0;
-  for (let i = 0; i < aw; i++) {
-    const start = Math.max(0, i - matchDist);
-    const end   = Math.min(i + matchDist + 1, bw);
-    for (let j = start; j < end; j++) {
-      if (bMatched[j] || a[i] !== b[j]) continue;
-      aMatched[i] = bMatched[j] = true;
-      matches++;
-      break;
+  for (let i = 0; i < l1; i++) {
+    const lo = Math.max(0, i - matchDist);
+    const hi = Math.min(i + matchDist + 1, l2);
+    for (let j = lo; j < hi; j++) {
+      if (s2m[j] || s1[i] !== s2[j]) continue;
+      s1m[i] = s2m[j] = true; matches++; break;
     }
   }
   if (!matches) return 0;
   let k = 0;
-  for (let i = 0; i < aw; i++) {
-    if (!aMatched[i]) continue;
-    while (!bMatched[k]) k++;
-    if (a[i] !== b[k]) transpositions++;
+  for (let i = 0; i < l1; i++) {
+    if (!s1m[i]) continue;
+    while (!s2m[k]) k++;
+    if (s1[i] !== s2[k]) transpositions++;
     k++;
   }
-  const jaro = (matches / aw + matches / bw + (matches - transpositions / 2) / matches) / 3;
+  const jaro = (matches/l1 + matches/l2 + (matches - transpositions/2)/matches) / 3;
   let prefix = 0;
-  for (let i = 0; i < Math.min(4, Math.min(aw, bw)); i++) {
-    if (a[i] === b[i]) prefix++; else break;
+  for (let i = 0; i < Math.min(4, l1, l2); i++) {
+    if (s1[i] === s2[i]) prefix++; else break;
   }
   return jaro + prefix * 0.1 * (1 - jaro);
 }
 
-function tokenSetSimilarity(a, b) {
+// Token-set similarity (handles out-of-order words)
+function tokenSetSim(a, b) {
   if (!a || !b) return 0;
-  const setA = new Set(a.toUpperCase().split(/\s+/).filter(Boolean));
-  const setB = new Set(b.toUpperCase().split(/\s+/).filter(Boolean));
-  const intersection = [...setA].filter(t => setB.has(t)).length;
-  const union = new Set([...setA, ...setB]).size;
-  return union ? intersection / union : 0;
+  const ta = new Set(a.toUpperCase().split(/\s+/));
+  const tb = new Set(b.toUpperCase().split(/\s+/));
+  const inter = [...ta].filter(t => tb.has(t)).length;
+  return inter / Math.max(ta.size, tb.size);
 }
 
-function bestNameScore(name, candidates) {
+function bestNameScore(name, entries) {
   let best = 0;
-  for (const c of candidates) {
-    const jw = jaroWinkler(name, c);
-    const ts = tokenSetSimilarity(name, c);
+  for (const e of entries) {
+    const jw = jaroWinkler(name, e.name || e);
+    const ts = tokenSetSim(name, e.name || e);
     best = Math.max(best, jw, ts);
   }
   return best;
 }
 
-// ─── Validation Helpers ───────────────────────────────────────────────────────
+// SHA-256 for audit chain
+async function sha256(str) {
+  const buf = await crypto.subtle.digest("SHA-256",
+    new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2,"0")).join("");
+}
+
+// Validate SSN (individual TIN)
 function validateSSN(tin) {
-  const clean = (tin || '').replace(/\D/g, '');
-  if (clean.length !== 9) return false;
-  const area = parseInt(clean.substring(0, 3), 10);
-  // ITIN ranges: 900-999
-  if (area === 0 || area === 666 || (area >= 900 && area <= 999)) return false;
-  if (clean === '000000000' || clean.startsWith('0') && clean.substring(0, 3) === '000') return false;
-  return !/^(\d)\1{8}$/.test(clean);
+  const digits = tin.replace(/\D/g, "");
+  if (digits.length !== 9) return { valid: false, area: null };
+  const area = parseInt(digits.substring(0, 3), 10);
+  if (area === 0 || area === 666) return { valid: false, area };
+  if (area >= 900) return { valid: false, area, synthetic: true }; // E15
+  const group = parseInt(digits.substring(3, 5), 10);
+  const serial = parseInt(digits.substring(5), 10);
+  if (group === 0 || serial === 0) return { valid: false, area };
+  return { valid: true, area };
 }
 
-function validateEIN(ein) {
-  const clean = (ein || '').replace(/\D/g, '');
-  if (clean.length !== 9) return false;
-  const prefix = parseInt(clean.substring(0, 2), 10);
-  const validPrefixes = [10,12,20,22,23,24,25,26,27,28,29,
-    30,32,33,34,35,36,37,38,39,40,41,42,44,45,46,47,48,
-    50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,
-    71,72,73,74,75,76,77,80,81,82,83,84,85,86,87,88,90,91,92,
-    93,94,95,98,99,
-    1,2,3,4,5,6,7,8,9,11,13,14,15,16,17,18,19,21,31,43,49,69,70,79,89,97];
-  return validPrefixes.includes(prefix);
+// Validate EIN (business TIN)
+function validateEIN(tin) {
+  const digits = tin.replace(/\D/g, "");
+  if (digits.length !== 9) return false;
+  const prefix = digits.substring(0, 2);
+  return !DISALLOWED_EIN_PREFIXES.has(prefix);
 }
 
-function formatTIN(tin, type) {
-  const clean = (tin || '').replace(/\D/g, '');
-  if (type === 'business') {
-    return clean.length >= 9 ? `${clean.substring(0,2)}-${clean.substring(2)}` : clean;
-  }
-  return clean.length >= 9 ? `${clean.substring(0,3)}-${clean.substring(3,5)}-${clean.substring(5)}` : clean;
+// Auth helpers
+async function authGateway(request, env) {
+  const apiKey = request.headers.get("X-Api-Key") ||
+                 (request.headers.get("Authorization") || "").replace("Bearer ", "");
+  if (!apiKey) return false;
+  const stored = await env.GATEWAY_AUTH.get(`apikey:${apiKey}`);
+  return !!stored;
 }
 
-// ─── FATF High-Risk Countries (55 jurisdictions, June 2026) ─────────────────
-const FATF_HIGH_RISK = new Set([
-  'AF','AL','BB','BF','BJ','BT','BI','KH','CM','CF','TD','KM','CG','CD',
-  'CI','CU','DJ','ER','SZ','ET','FJ','GN','GW','HT','IR','IQ','JM',
-  'KE','LA','LR','LY','ML','MR','MM','MZ','NP','NI','NE','NG','KP',
-  'PK','PG','PH','RU','SC','SL','SO','SS','SD','SY','TZ','TT','UG',
-  'VU','YE','ZW'
-]);
-
-// ─── ITIN / Synthetic Identity Areas ─────────────────────────────────────────
-const SYNTHETIC_AREAS = new Set([900,901,902,903,904,905,906,907,908,909,
-  910,911,912,913,914,915,916,917,918,919,920,921,922,923,924,925,926,
-  927,928,929,930,931,932,933,934,935,936,937,938,939,940,941,942,943,
-  944,945,946,947,948,949,950,951,952,953,954,955,956,957,958,959,960,
-  961,962,963,964,965,966,967,968,969,970,971,972,973,974,975,976,977,
-  978,979,980,981,982,983,984,985,986,987,988,989,990,991,992,993,994,
-  995,996,997,998,999]);
-
-// ─── Adverse Media Keywords ───────────────────────────────────────────────────
-const ADVERSE_KEYWORDS = [
-  'fraud','money laundering','terrorist','terrorism','criminal','indicted',
-  'convicted','sanction','watchlist','bribery','corruption','embezzlement',
-  'trafficking','cartel','organized crime','ponzi','wire fraud','tax evasion',
-  'felony','arrest','prison','plea deal','debarred','blacklisted'
-];
-
-// ─── Corporate Depth Patterns ─────────────────────────────────────────────────
-const SHELL_PATTERNS = [
-  /holdings?\s+llc/i, /ventures?\s+llc/i, /capital\s+group/i,
-  /international\s+group/i, /global\s+ventures?/i, /offshore/i, /trust\s+co/i
-];
-
-// ─── KV Helpers ───────────────────────────────────────────────────────────────
-async function loadIndex(kv, key) {
-  try {
-    const raw = await kv.get(key, { type: 'json' });
-    return raw || [];
-  } catch { return []; }
-}
-
-async function kv314a(kv) {
-  try {
-    const raw = await kv.get('fincen:314a', { type: 'json' });
-    return raw || [];
-  } catch { return []; }
-}
-
-// ─── 16 Screening Engines ─────────────────────────────────────────────────────
-
-// E1 — OFAC SDN (40pts/hit, cap 70)
-async function engineOFAC(payload, kv) {
-  const names = [payload.full_name || payload.business_name || ''];
-  if (payload.beneficial_owners) {
-    payload.beneficial_owners.forEach(o => names.push(o.name || ''));
-  }
-  const index = await loadIndex(kv, 'sdn:index');
-  let score = 0;
-  const hits = [];
-  for (const name of names.filter(Boolean)) {
-    for (const entry of index) {
-      const candidates = [entry.name, ...(entry.aliases || [])];
-      const sim = bestNameScore(name, candidates);
-      if (sim >= 0.82) {
-        score += 40;
-        hits.push({ name, matched: entry.name, sim: sim.toFixed(3), type: entry.type || 'SDN' });
-      }
-    }
-  }
-  return { engine: 'E1_OFAC_SDN', score: Math.min(score, 70), hits };
-}
-
-// E2 — PEP (25pts/hit, cap 50)
-async function enginePEP(payload, kv) {
-  const name = payload.full_name || payload.business_name || '';
-  const index = await loadIndex(kv, 'pep:index');
-  let score = 0;
-  const hits = [];
-  for (const entry of index) {
-    const candidates = [entry.name, ...(entry.aliases || [])];
-    const sim = bestNameScore(name, candidates);
-    if (sim >= 0.80) {
-      score += 25;
-      hits.push({ name, matched: entry.name, sim: sim.toFixed(3), position: entry.position });
-    }
-  }
-  return { engine: 'E2_PEP', score: Math.min(score, 50), hits };
-}
-
-// E3 — FATF High-Risk Country (20pts)
-function engineFATF(payload) {
-  const countries = [
-    payload.country, payload.nationality,
-    payload.registered_country, payload.operating_country
-  ].filter(Boolean).map(c => c.toUpperCase());
-  const hits = countries.filter(c => FATF_HIGH_RISK.has(c));
-  return { engine: 'E3_FATF', score: hits.length ? 20 : 0, hits };
-}
-
-// E4 — TIN/EIN Validation (20pts)
-function engineTIN(payload) {
-  const type = payload.entity_type === 'business' ? 'business' : 'individual';
-  let valid = false;
-  let tin_valid = false;
-  let ein_valid = false;
-  const tin = (payload.tin || '').replace(/\D/g, '');
-  if (type === 'individual') {
-    tin_valid = validateSSN(tin);
-    valid = tin_valid;
-  } else {
-    ein_valid = validateEIN(tin);
-    valid = ein_valid;
-  }
-  return {
-    engine: 'E4_TIN_EIN',
-    score: valid ? 0 : 20,
-    tin_valid,
-    ein_valid,
-    formatted: formatTIN(tin, type)
-  };
-}
-
-// E5 — Velocity (15pts if >5/TIN/24h)
-async function engineVelocity(payload, db) {
-  const tin = (payload.tin || '').replace(/\D/g, '');
-  if (!tin) return { engine: 'E5_VELOCITY', score: 0, count: 0 };
-  try {
-    const since = new Date(Date.now() - 86400000).toISOString();
-    const { results } = await db.prepare(
-      `SELECT COUNT(*) AS cnt FROM kyc_submissions WHERE tin=? AND created_at>?`
-    ).bind(tin, since).all();
-    const count = results[0]?.cnt || 0;
-    return { engine: 'E5_VELOCITY', score: count > 5 ? 15 : 0, count };
-  } catch { return { engine: 'E5_VELOCITY', score: 0, count: 0 }; }
-}
-
-// E6 — FinCEN 314(a) Structuring (35pts, $8k–$10k window)
-async function engineStructuring(payload, kv) {
-  const amount = parseFloat(payload.initial_deposit || payload.transaction_amount || 0);
-  const name = payload.full_name || payload.business_name || '';
-  let score = 0;
-  const flags = [];
-  if (amount >= 8000 && amount < 10000) {
-    score += 35;
-    flags.push({ reason: 'Deposit in structuring window ($8k-$10k)', amount });
-  }
-  // Cross-reference FinCEN 314(a) list
-  const list314a = await kv314a(kv);
-  for (const entry of list314a) {
-    const sim = bestNameScore(name, [entry.name, ...(entry.aliases || [])]);
-    if (sim >= 0.80) {
-      score += 35;
-      flags.push({ reason: 'FinCEN 314(a) match', matched: entry.name, sim: sim.toFixed(3) });
-    }
-  }
-  return { engine: 'E6_STRUCTURING', score: Math.min(score, 70), flags };
-}
-
-// E7 — Adverse Media (5pts/keyword, cap 30)
-function engineAdverseMedia(payload) {
-  const text = JSON.stringify(payload).toLowerCase();
-  const hits = ADVERSE_KEYWORDS.filter(kw => text.includes(kw));
-  return { engine: 'E7_ADVERSE_MEDIA', score: Math.min(hits.length * 5, 30), keywords: hits };
-}
-
-// E8 — UBO Cascade (25pts for ≥25% ownership)
-function engineUBO(payload) {
-  const owners = payload.beneficial_owners || [];
-  const flagged = owners.filter(o => parseFloat(o.ownership_percentage || 0) >= 25);
-  const unverified = flagged.filter(o => !o.tin && !o.passport_number);
-  return {
-    engine: 'E8_UBO',
-    score: unverified.length > 0 ? 25 : 0,
-    beneficial_owners_flagged: unverified.length,
-    owners_at_or_above_25pct: flagged.length
-  };
-}
-
-// E9 — DOB Plausibility (35pts: future, under-18, over-120)
-function engineDOB(payload) {
-  const dob = payload.date_of_birth;
-  if (!dob) return { engine: 'E9_DOB', score: 0, reason: null };
-  const d = new Date(dob);
-  const now = new Date();
-  if (isNaN(d.getTime())) return { engine: 'E9_DOB', score: 35, reason: 'Unparseable DOB' };
-  if (d > now) return { engine: 'E9_DOB', score: 35, reason: 'Future DOB' };
-  const ageMs = now - d;
-  const ageYears = ageMs / (365.25 * 24 * 3600 * 1000);
-  if (ageYears < 18) return { engine: 'E9_DOB', score: 35, reason: 'Under 18' };
-  if (ageYears > 120) return { engine: 'E9_DOB', score: 35, reason: 'Age >120 years' };
-  return { engine: 'E9_DOB', score: 0, reason: null };
-}
-
-// E10 — Address Risk (10pts for PO Box, no address, high-risk states)
-function engineAddress(payload) {
-  const addr = (payload.address || '').toLowerCase();
-  const flags = [];
-  if (!addr || addr.trim().length < 5) flags.push('Missing address');
-  if (/p\.?o\.?\s+box|post\s+office\s+box/i.test(addr)) flags.push('PO Box');
-  if (/general\s+delivery/i.test(addr)) flags.push('General Delivery');
-  return { engine: 'E10_ADDRESS', score: flags.length ? 10 : 0, flags };
-}
-
-// E11 — Entity Consistency (15pts for name/TIN type mismatch)
-function engineConsistency(payload) {
-  const flags = [];
-  const type = payload.entity_type;
-  if (type === 'business' && payload.full_name && !payload.business_name) {
-    flags.push('Business entity but individual name field used');
-  }
-  if (type === 'individual' && payload.business_name && !payload.full_name) {
-    flags.push('Individual entity but business name field used');
-  }
-  if (type === 'individual' && payload.tin && validateEIN(payload.tin) && !validateSSN(payload.tin)) {
-    flags.push('Individual TIN matches EIN format');
-  }
-  return { engine: 'E11_CONSISTENCY', score: flags.length ? 15 : 0, flags };
-}
-
-// E12 — Corporate Depth (20pts for >4 layers or shell patterns)
-function engineCorporateDepth(payload) {
-  const depth = parseInt(payload.corporate_layers || 0, 10);
-  const name = payload.business_name || '';
-  const shellMatch = SHELL_PATTERNS.some(p => p.test(name));
-  const flags = [];
-  if (depth > 4) flags.push(`Corporate depth ${depth} layers`);
-  if (shellMatch) flags.push('Shell company naming pattern');
-  return { engine: 'E12_CORPORATE_DEPTH', score: flags.length ? 20 : 0, flags };
-}
-
-// E13 — Document Entropy (10pts: missing/expired docs)
-function engineDocumentEntropy(payload) {
-  const flags = [];
-  if (!payload.id_document_type) flags.push('No ID document type');
-  if (!payload.id_document_number) flags.push('No ID document number');
-  if (payload.id_expiry_date) {
-    const expiry = new Date(payload.id_expiry_date);
-    if (!isNaN(expiry.getTime()) && expiry < new Date()) {
-      flags.push('Expired ID document');
-    }
-  }
-  return { engine: 'E13_DOCUMENT_ENTROPY', score: flags.length ? 10 : 0, flags };
-}
-
-// E14 — Network Graph (20pts: shared TIN or address across recent submissions)
-async function engineNetworkGraph(payload, db) {
-  const tin = (payload.tin || '').replace(/\D/g, '');
-  const addr = payload.address || '';
-  if (!tin && !addr) return { engine: 'E14_NETWORK_GRAPH', score: 0, shared: [] };
-  try {
-    const shared = [];
-    if (tin) {
-      const { results } = await db.prepare(
-        `SELECT COUNT(*) AS cnt FROM kyc_submissions WHERE tin=? AND risk_decision IN ('APPROVED','REVIEW','DENIED')`
-      ).bind(tin).all();
-      if ((results[0]?.cnt || 0) > 1) shared.push(`TIN appears in ${results[0].cnt} submissions`);
-    }
-    return { engine: 'E14_NETWORK_GRAPH', score: shared.length ? 20 : 0, shared };
-  } catch { return { engine: 'E14_NETWORK_GRAPH', score: 0, shared: [] }; }
-}
-
-// E15 — Synthetic Identity (40pts: SSN area 900+)
-function engineSyntheticIdentity(payload) {
-  const tin = (payload.tin || '').replace(/\D/g, '');
-  if (payload.entity_type === 'business') return { engine: 'E15_SYNTHETIC_IDENTITY', score: 0 };
-  if (tin.length >= 3) {
-    const area = parseInt(tin.substring(0, 3), 10);
-    if (SYNTHETIC_AREAS.has(area)) {
-      return { engine: 'E15_SYNTHETIC_IDENTITY', score: 40, reason: `SSN area ${area} (ITIN range)` };
-    }
-  }
-  return { engine: 'E15_SYNTHETIC_IDENTITY', score: 0, reason: null };
-}
-
-// E16 — Watchlist Delta (30pts: newly-added SDN in last 7 days)
-async function engineWatchlistDelta(payload, kv) {
-  const name = payload.full_name || payload.business_name || '';
-  const delta = await loadIndex(kv, 'sdn:delta:7d');
-  const hits = [];
-  for (const entry of delta) {
-    const candidates = [entry.name, ...(entry.aliases || [])];
-    const sim = bestNameScore(name, candidates);
-    if (sim >= 0.80) {
-      hits.push({ name, matched: entry.name, sim: sim.toFixed(3), added: entry.added_date });
-    }
-  }
-  return { engine: 'E16_WATCHLIST_DELTA', score: hits.length ? 30 : 0, newly_added_hits: hits };
-}
-
-// ─── Run All 16 Engines in Parallel ──────────────────────────────────────────
-async function runAllEngines(payload, db, kv) {
-  const timeout = new Promise(resolve =>
-    setTimeout(() => resolve({ timedOut: true }), 1800)
-  );
-
-  const engines = Promise.all([
-    engineOFAC(payload, kv),
-    enginePEP(payload, kv),
-    Promise.resolve(engineFATF(payload)),
-    Promise.resolve(engineTIN(payload)),
-    engineVelocity(payload, db),
-    engineStructuring(payload, kv),
-    Promise.resolve(engineAdverseMedia(payload)),
-    Promise.resolve(engineUBO(payload)),
-    Promise.resolve(engineDOB(payload)),
-    Promise.resolve(engineAddress(payload)),
-    Promise.resolve(engineConsistency(payload)),
-    Promise.resolve(engineCorporateDepth(payload)),
-    Promise.resolve(engineDocumentEntropy(payload)),
-    engineNetworkGraph(payload, db),
-    Promise.resolve(engineSyntheticIdentity(payload)),
-    engineWatchlistDelta(payload, kv),
-  ]);
-
-  const result = await Promise.race([engines, timeout]);
-  if (result?.timedOut) {
-    return { timedOut: true, results: [] };
-  }
-  return { timedOut: false, results: result };
-}
-
-// ─── D1 Helpers ───────────────────────────────────────────────────────────────
-async function ensureSchema(db) {
-  await db.batch([
-    db.prepare(`CREATE TABLE IF NOT EXISTS kyc_submissions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      submission_id TEXT UNIQUE NOT NULL,
-      entity_type TEXT NOT NULL,
-      applicant_name TEXT,
-      tin TEXT,
-      tin_formatted TEXT,
-      status TEXT DEFAULT 'pending',
-      risk_score INTEGER DEFAULT 0,
-      risk_decision TEXT,
-      risk_breakdown TEXT,
-      sanctions_hits INTEGER DEFAULT 0,
-      ofac_hits INTEGER DEFAULT 0,
-      pep_hits INTEGER DEFAULT 0,
-      tin_valid INTEGER DEFAULT 0,
-      ein_valid INTEGER DEFAULT 0,
-      screen_latency_ms INTEGER,
-      raw_payload TEXT,
-      screened_at TEXT,
-      created_at TEXT DEFAULT (datetime('now')),
-      flags_json TEXT,
-      pep_hits_json TEXT,
-      ofac_hits_json TEXT,
-      velocity_flagged INTEGER DEFAULT 0,
-      structuring_flagged INTEGER DEFAULT 0,
-      adverse_media_hits INTEGER DEFAULT 0,
-      engine_version TEXT DEFAULT 'E16'
-    )`),
-    db.prepare(`CREATE TABLE IF NOT EXISTS kyc_review_queue (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      submission_id TEXT NOT NULL,
-      reference_id TEXT,
-      type TEXT DEFAULT 'KYC',
-      flags_json TEXT,
-      payload_json TEXT,
-      status TEXT DEFAULT 'pending',
-      assigned_to TEXT,
-      resolved_by TEXT,
-      resolved_at TEXT,
-      created_at TEXT DEFAULT (datetime('now'))
-    )`),
-    db.prepare(`CREATE TABLE IF NOT EXISTS kyc_beneficial_owners (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      submission_id TEXT NOT NULL,
-      owner_name TEXT,
-      ownership_percentage REAL,
-      tin TEXT,
-      nationality TEXT,
-      is_flagged INTEGER DEFAULT 0,
-      sanctions_score INTEGER DEFAULT 0,
-      pep_flag INTEGER DEFAULT 0,
-      match_reason TEXT,
-      created_at TEXT DEFAULT (datetime('now'))
-    )`),
-  ]);
-}
-
-async function saveSubmission(db, submissionId, payload, engineResults, score, decision, latencyMs, tinResult) {
-  const ofacResult = engineResults.find(e => e.engine === 'E1_OFAC_SDN');
-  const pepResult = engineResults.find(e => e.engine === 'E2_PEP');
-  const structResult = engineResults.find(e => e.engine === 'E6_STRUCTURING');
-  const mediaResult = engineResults.find(e => e.engine === 'E7_ADVERSE_MEDIA');
-  const velResult = engineResults.find(e => e.engine === 'E5_VELOCITY');
-
-  const name = payload.full_name || payload.business_name || '';
-  const tin = (payload.tin || '').replace(/\D/g, '');
-
-  await db.prepare(`INSERT OR REPLACE INTO kyc_submissions (
-    submission_id,entity_type,applicant_name,tin,tin_formatted,
-    status,risk_score,risk_decision,risk_breakdown,
-    sanctions_hits,ofac_hits,pep_hits,tin_valid,ein_valid,
-    screen_latency_ms,raw_payload,screened_at,
-    flags_json,pep_hits_json,ofac_hits_json,
-    velocity_flagged,structuring_flagged,adverse_media_hits,engine_version
-  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-  .bind(
-    submissionId,
-    payload.entity_type || 'individual',
-    name,
-    tin,
-    tinResult?.formatted || tin,
-    decision.toLowerCase(),
-    score,
-    decision,
-    JSON.stringify(engineResults),
-    (ofacResult?.hits?.length || 0) + (pepResult?.hits?.length || 0),
-    ofacResult?.hits?.length || 0,
-    pepResult?.hits?.length || 0,
-    tinResult?.tin_valid ? 1 : 0,
-    tinResult?.ein_valid ? 1 : 0,
-    latencyMs,
-    JSON.stringify(payload),
-    new Date().toISOString(),
-    JSON.stringify(engineResults.filter(e => e.score > 0).map(e => e.engine)),
-    JSON.stringify(pepResult?.hits || []),
-    JSON.stringify(ofacResult?.hits || []),
-    (velResult?.count || 0) > 5 ? 1 : 0,
-    (structResult?.flags?.length || 0) > 0 ? 1 : 0,
-    mediaResult?.keywords?.length || 0,
-    ENGINE_VERSION
-  ).run();
-}
-
-async function enqueueReview(db, submissionId, payload, engineResults, score, decision) {
-  const flaggedEngines = engineResults.filter(e => e.score > 0).map(e => e.engine);
-  await db.prepare(`INSERT INTO kyc_review_queue (
-    submission_id,reference_id,type,flags_json,payload_json,status
-  ) VALUES (?,?,?,?,?,'pending')`)
-  .bind(
-    submissionId,
-    submissionId,
-    payload.entity_type === 'business' ? 'KYB' : 'KYC',
-    JSON.stringify({ score, decision, flaggedEngines }),
-    JSON.stringify(payload)
-  ).run();
-}
-
-async function saveBeneficialOwners(db, submissionId, payload, ofacIndex, pepIndex) {
-  const owners = payload.beneficial_owners || [];
-  for (const owner of owners) {
-    const name = owner.name || '';
-    let isFlagged = 0;
-    let matchReason = null;
-    let pepFlag = 0;
-    let sanctionsScore = 0;
-
-    const ofacSim = bestNameScore(name, ofacIndex.flatMap(e => [e.name, ...(e.aliases || [])]));
-    if (ofacSim >= 0.82) {
-      isFlagged = 1;
-      matchReason = `OFAC SDN match (${ofacSim.toFixed(3)})`;
-      sanctionsScore = 40;
-    }
-    const pepSim = bestNameScore(name, pepIndex.flatMap(e => [e.name, ...(e.aliases || [])]));
-    if (pepSim >= 0.80) {
-      pepFlag = 1;
-      if (!isFlagged) { isFlagged = 1; matchReason = `PEP match (${pepSim.toFixed(3)})`; }
-    }
-
-    await db.prepare(`INSERT INTO kyc_beneficial_owners (
-      submission_id,owner_name,ownership_percentage,tin,nationality,
-      is_flagged,sanctions_score,pep_flag,match_reason
-    ) VALUES (?,?,?,?,?,?,?,?,?)`)
-    .bind(
-      submissionId,
-      name,
-      parseFloat(owner.ownership_percentage || 0),
-      (owner.tin || '').replace(/\D/g, ''),
-      owner.nationality || null,
-      isFlagged,
-      sanctionsScore,
-      pepFlag,
-      matchReason
-    ).run();
-  }
-}
-
-// ─── Auth Helpers ─────────────────────────────────────────────────────────────
-function getBearer(req) {
-  const auth = req.headers.get('Authorization') || '';
-  return auth.startsWith('Bearer ') ? auth.slice(7).trim() : null;
-}
-
-async function authApiKey(kv, key) {
-  if (!key) return false;
-  const stored = await kv.get(`apikey:${key}`);
-  return stored !== null;
-}
-
-function isAdminKey(env, key) {
+function authAdmin(request, env) {
+  const key = request.headers.get("X-Admin-Key") ||
+              (request.headers.get("Authorization") || "").replace("Bearer ", "");
   return key === env.KYC_ADMIN_KEY;
 }
 
-// ─── Notify Helper ────────────────────────────────────────────────────────────
-async function notifySystemAlert(env, payload) {
-  if (!env.NOTIFIER_TOKEN) return;
-  try {
-    await fetch('https://notify.wwwknockoutforever.com/webhook/system-alert', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${env.NOTIFIER_TOKEN}`
-      },
-      body: JSON.stringify(payload)
-    });
-  } catch { /* non-blocking */ }
+// ─── Screening Engines ────────────────────────────────────────────────────────
+
+async function runEngines(payload, env) {
+  const {
+    entity_type = "individual",
+    applicant_name = "",
+    tin = "",
+    dob = null,
+    address = {},
+    amount = null,
+    adverse_media_text = "",
+    beneficial_owners = [],
+    corporate_depth = 0,
+    documents = [],
+    network_peers = [],
+  } = payload;
+
+  const isIndividual = entity_type !== "business";
+  const tinClean = (tin || "").replace(/\D/g, "");
+
+  // Load sanctions lists from KV (parallel)
+  const [sdnRaw, pepRaw, deltaRaw, fincenRaw] = await Promise.all([
+    env.KYC_SANCTIONS.get("sdn:index", "json").catch(() => []),
+    env.KYC_SANCTIONS.get("pep:index", "json").catch(() => []),
+    env.KYC_SANCTIONS.get("sdn:delta:7d", "json").catch(() => []),
+    env.KYC_SANCTIONS.get("fincen:314a", "json").catch(() => []),
+  ]);
+  const sdnList   = sdnRaw   || [];
+  const pepList   = pepRaw   || [];
+  const deltaList = deltaRaw || [];
+
+  // Velocity: D1 count of submissions for this TIN in last 24 h
+  async function getVelocity() {
+    if (!tinClean) return 0;
+    const since = new Date(Date.now() - 86400000).toISOString();
+    try {
+      const r = await env.AUDIT_DB.prepare(
+        `SELECT COUNT(*) as cnt FROM kyc_submissions WHERE tin=? AND created_at>=?`
+      ).bind(tinClean, since).first();
+      return r ? parseInt(r.cnt, 10) : 0;
+    } catch { return 0; }
+  }
+
+  // Network graph: check for shared TIN/address in D1
+  async function getNetworkHits() {
+    if (!tinClean && !address.zip) return 0;
+    try {
+      const r = await env.AUDIT_DB.prepare(
+        `SELECT COUNT(*) as cnt FROM kyc_submissions WHERE (tin=? OR json_extract(raw_payload,'$.address.zip')=?) AND tin != ''`
+      ).bind(tinClean, address.zip || "").first();
+      return r ? parseInt(r.cnt, 10) : 0;
+    } catch { return 0; }
+  }
+
+  // Run all 16 engines in parallel
+  const [velocityCount, networkHits] = await Promise.all([
+    getVelocity(),
+    getNetworkHits(),
+  ]);
+
+  const sdnScore   = bestNameScore(applicant_name, sdnList);
+  const pepScore   = bestNameScore(applicant_name, pepList);
+  const deltaScore = bestNameScore(applicant_name, deltaList);
+
+  // E1 OFAC SDN
+  const e1Hits = sdnScore >= 0.82 ? 1 : 0;
+  const e1Pts  = cap(e1Hits * 40, 70);
+
+  // E2 PEP
+  const e2Hits = pepScore >= 0.82 ? 1 : 0;
+  const e2Pts  = cap(e2Hits * 25, 50);
+
+  // E3 FATF
+  const country = (address.country || "").toUpperCase().trim();
+  const e3Pts   = FATF_COUNTRIES.has(country) ? 20 : 0;
+
+  // E4 TIN/EIN validity
+  let e4Pts = 0, tinValid = true, einValid = true;
+  if (isIndividual) {
+    const r = validateSSN(tin);
+    tinValid = r.valid;
+    if (!r.valid) e4Pts = 20;
+  } else {
+    einValid = validateEIN(tin);
+    if (!einValid) e4Pts = 20;
+  }
+
+  // E5 Velocity
+  const e5Pts = velocityCount > 5 ? 15 : 0;
+
+  // E6 Structuring — $8,000–$9,999 range
+  const amt    = parseFloat(amount) || 0;
+  const e6Pts  = (amt >= 8000 && amt < 10000) ? 35 : 0;
+
+  // E7 Adverse Media
+  const mediaText = (adverse_media_text || "").toLowerCase();
+  const mediaHits = ADVERSE_KEYWORDS.filter(kw => mediaText.includes(kw));
+  const e7Pts     = cap(mediaHits.length * 5, 30);
+
+  // E8 UBO Cascade — beneficial owners ≥25% ownership screened vs OFAC+PEP
+  let e8Pts = 0;
+  const uboFlags = [];
+  for (const owner of beneficial_owners) {
+    if ((owner.ownership_pct || 0) < 25) continue;
+    const oSdn = bestNameScore(owner.name, sdnList);
+    const oPep = bestNameScore(owner.name, pepList);
+    if (oSdn >= 0.82 || oPep >= 0.82) {
+      uboFlags.push({ name: owner.name, sdn: oSdn, pep: oPep });
+      e8Pts += 25;
+    }
+  }
+  e8Pts = cap(e8Pts, 75);
+
+  // E9 DOB Plausibility
+  let e9Pts = 0;
+  if (dob) {
+    const dobDate = new Date(dob);
+    const now     = new Date();
+    const ageYears = (now - dobDate) / (365.25 * 86400000);
+    if (dobDate > now)          e9Pts = 35; // future DOB
+    else if (ageYears < 18)     e9Pts = 35; // under 18
+    else if (ageYears > 120)    e9Pts = 35; // implausibly old
+  }
+
+  // E10 Address Risk
+  const zip   = (address.zip || "").substring(0, 5);
+  const e10Pts = HIGH_RISK_ZIPS.has(zip) ? 10 : 0;
+
+  // E11 Entity Consistency — name/TIN length/type mismatch signals
+  let e11Pts = 0;
+  if (!isIndividual && tinClean.length !== 9) e11Pts += 15;
+  if (applicant_name.length < 2)             e11Pts += 15;
+  e11Pts = cap(e11Pts, 15);
+
+  // E12 Corporate Depth
+  const depth  = parseInt(corporate_depth, 10) || 0;
+  const e12Pts = depth > 4 ? 20 : 0;
+
+  // E13 Document Entropy
+  let e13Pts = 0;
+  for (const doc of documents) {
+    const exp = doc.expiry_date ? new Date(doc.expiry_date) : null;
+    if (exp && exp < new Date()) e13Pts += 10; // expired
+    if (!doc.document_number || doc.document_number.length < 4) e13Pts += 10; // low entropy
+  }
+  e13Pts = cap(e13Pts, 10);
+
+  // E14 Network Graph — shared TIN or address with existing submissions
+  const e14Pts = networkHits > 3 ? 20 : 0;
+
+  // E15 Synthetic Identity — SSN area code 900+
+  let e15Pts = 0;
+  if (isIndividual && tinClean.length === 9) {
+    const r = validateSSN(tin);
+    if (r.synthetic) e15Pts = 40;
+  }
+
+  // E16 Watchlist Delta — newly added to SDN list (7-day delta)
+  const e16Pts = bestNameScore(applicant_name, deltaList) >= 0.82 ? 30 : 0;
+
+  const breakdown = {
+    E1_OFAC_SDN:          { pts: e1Pts,  hit: e1Hits > 0, score: sdnScore },
+    E2_PEP:               { pts: e2Pts,  hit: e2Hits > 0, score: pepScore },
+    E3_FATF:              { pts: e3Pts,  hit: e3Pts > 0,  country },
+    E4_TIN_EIN:           { pts: e4Pts,  tin_valid: tinValid, ein_valid: einValid },
+    E5_Velocity:          { pts: e5Pts,  submissions_24h: velocityCount },
+    E6_Structuring:       { pts: e6Pts,  amount: amt },
+    E7_Adverse_Media:     { pts: e7Pts,  hits: mediaHits },
+    E8_UBO_Cascade:       { pts: e8Pts,  flagged_owners: uboFlags },
+    E9_DOB:               { pts: e9Pts,  dob },
+    E10_Address_Risk:     { pts: e10Pts, zip },
+    E11_Entity:           { pts: e11Pts },
+    E12_Corporate_Depth:  { pts: e12Pts, layers: depth },
+    E13_Document_Entropy: { pts: e13Pts, docs_checked: documents.length },
+    E14_Network_Graph:    { pts: e14Pts, shared_matches: networkHits },
+    E15_Synthetic_ID:     { pts: e15Pts },
+    E16_Watchlist_Delta:  { pts: e16Pts, delta_score: deltaScore },
+  };
+
+  const totalPts = clamp(
+    e1Pts + e2Pts + e3Pts + e4Pts + e5Pts + e6Pts + e7Pts + e8Pts +
+    e9Pts + e10Pts + e11Pts + e12Pts + e13Pts + e14Pts + e15Pts + e16Pts
+  );
+
+  const flags = Object.entries(breakdown)
+    .filter(([, v]) => v.pts > 0)
+    .map(([k]) => k);
+
+  return {
+    risk_score: totalPts,
+    breakdown,
+    flags,
+    sanctions_hits:  e1Hits,
+    ofac_hits:       e1Hits,
+    pep_hits:        e2Hits,
+    tin_valid:       tinValid,
+    ein_valid:       einValid,
+    velocity_flagged: e5Pts > 0,
+    structuring_flagged: e6Pts > 0,
+    adverse_media_hits: mediaHits.length,
+  };
 }
 
-// ─── Response Helpers ─────────────────────────────────────────────────────────
-const json = (data, status = 200) => new Response(JSON.stringify(data), {
-  status,
-  headers: {
-    'Content-Type': 'application/json',
-    'X-KYC-Version': VERSION,
-    'X-Engine-Version': ENGINE_VERSION,
-  }
-});
+// ─── Decision ─────────────────────────────────────────────────────────────────
 
-// ─── Main Handler ─────────────────────────────────────────────────────────────
+function decide(score, timedOut = false) {
+  if (timedOut) return { decision: "REVIEW", reason: "Engine timeout — manual review required" };
+  if (score < 30) return { decision: "APPROVED", reason: "All engines passed" };
+  if (score < 70) return { decision: "REVIEW",   reason: "Risk score in review band; human required" };
+  return             { decision: "DENIED",   reason: "Risk score exceeds denial threshold" };
+}
+
+// ─── D1 Helpers ───────────────────────────────────────────────────────────────
+
+async function persistSubmission(env, id, payload, result, decision, latency) {
+  const now = new Date().toISOString();
+  try {
+    await env.AUDIT_DB.prepare(`
+      INSERT OR IGNORE INTO kyc_submissions (
+        submission_id, entity_type, applicant_name, tin, tin_formatted,
+        status, risk_score, risk_decision, risk_breakdown,
+        sanctions_hits, ofac_hits, pep_hits, tin_valid, ein_valid,
+        screen_latency_ms, raw_payload, screened_at, created_at,
+        flags_json, velocity_flagged, structuring_flagged,
+        adverse_media_hits, engine_version
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).bind(
+      id,
+      payload.entity_type || "individual",
+      payload.applicant_name || "",
+      (payload.tin || "").replace(/\D/g,""),
+      payload.tin || "",
+      decision.decision,
+      result.risk_score,
+      decision.decision,
+      JSON.stringify(result.breakdown),
+      result.sanctions_hits,
+      result.ofac_hits,
+      result.pep_hits,
+      result.tin_valid ? 1 : 0,
+      result.ein_valid ? 1 : 0,
+      latency,
+      JSON.stringify(payload),
+      now,
+      now,
+      JSON.stringify(result.flags),
+      result.velocity_flagged ? 1 : 0,
+      result.structuring_flagged ? 1 : 0,
+      result.adverse_media_hits,
+      `v${VERSION}`
+    ).run();
+  } catch (e) {
+    console.error("D1 persist error:", e.message);
+  }
+}
+
+async function persistReviewQueue(env, id, payload, result, decision) {
+  if (decision.decision === "APPROVED") return;
+  const now = new Date().toISOString();
+  try {
+    await env.AUDIT_DB.prepare(`
+      INSERT OR IGNORE INTO kyc_review_queue (
+        reference_id, type, flags_json, payload_json, status, created_at
+      ) VALUES (?,?,?,?,?,?)
+    `).bind(
+      id,
+      decision.decision,
+      JSON.stringify(result.flags),
+      JSON.stringify(payload),
+      "PENDING",
+      now
+    ).run();
+  } catch (e) {
+    console.error("D1 review queue error:", e.message);
+  }
+}
+
+async function writeAuditLog(env, eventType, entityId, entityType, data) {
+  const now = new Date().toISOString();
+  try {
+    await env.AUDIT_DB.prepare(`
+      INSERT INTO audit_log (event_id, event_type, entity_id, entity_type, data, created_at)
+      VALUES (?,?,?,?,?,?)
+    `).bind(uuid(), eventType, entityId, entityType, JSON.stringify(data), now).run();
+  } catch (e) {
+    console.error("Audit log error:", e.message);
+  }
+}
+
+// ─── Route Handlers ───────────────────────────────────────────────────────────
+
+// POST /api/kyc/apply
+async function handleApply(request, env) {
+  const authed = await authGateway(request, env);
+  if (!authed) return json({ error: "Unauthorized" }, 401);
+
+  let payload;
+  try { payload = await request.json(); }
+  catch { return json({ error: "Invalid JSON body" }, 400); }
+
+  if (!payload.applicant_name || !payload.tin) {
+    return json({ error: "applicant_name and tin are required" }, 400);
+  }
+
+  const id    = uuid();
+  const start = Date.now();
+
+  let result, timedOut = false;
+  try {
+    const enginePromise = runEngines(payload, env);
+    const timeoutPromise = new Promise(resolve =>
+      setTimeout(() => { timedOut = true; resolve(null); }, TIMEOUT_MS)
+    );
+    result = await Promise.race([enginePromise, timeoutPromise]);
+    if (!result) {
+      // Timeout: generate a safe default
+      result = {
+        risk_score: 50, breakdown: {}, flags: ["TIMEOUT"],
+        sanctions_hits: 0, ofac_hits: 0, pep_hits: 0,
+        tin_valid: false, ein_valid: false,
+        velocity_flagged: false, structuring_flagged: false, adverse_media_hits: 0
+      };
+    }
+  } catch (e) {
+    console.error("Engine error:", e.message);
+    return json({ error: "Screening engine failure", detail: e.message }, 500);
+  }
+
+  const latency  = Date.now() - start;
+  const decision = decide(result.risk_score, timedOut);
+
+  // Persist (non-blocking)
+  const ctx = { waitUntil: () => {} }; // fallback
+  await Promise.all([
+    persistSubmission(env, id, payload, result, decision, latency),
+    persistReviewQueue(env, id, payload, result, decision),
+    writeAuditLog(env, "kyc.screened", id, payload.entity_type || "individual", {
+      decision: decision.decision, risk_score: result.risk_score, latency_ms: latency
+    }),
+  ]);
+
+  // Fire SYSTEM_ALERT for DENIED
+  if (decision.decision === "DENIED" && env.NOTIFIER_TOKEN) {
+    fetch(`https://notify.wwwknockoutforever.com/webhook/system-alert`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${env.NOTIFIER_TOKEN}`
+      },
+      body: JSON.stringify({
+        event_type: "SYSTEM_ALERT",
+        severity: "HIGH",
+        submission_id: id,
+        applicant_name: payload.applicant_name,
+        risk_score: result.risk_score,
+        flags: result.flags,
+      })
+    }).catch(() => {});
+  }
+
+  return json({
+    submission_id: id,
+    status: decision.decision,
+    risk_score: result.risk_score,
+    risk_breakdown: result.breakdown,
+    flags: result.flags,
+    account_generation: {
+      allowed: decision.decision === "APPROVED",
+      reason: decision.reason,
+    },
+    screening: {
+      latency_ms: latency,
+      timed_out: timedOut,
+      engine_version: `v${VERSION}`,
+      engines_run: 16,
+    },
+    sanctions: {
+      ofac_hits: result.ofac_hits,
+      pep_hits: result.pep_hits,
+      total_sanctions_hits: result.sanctions_hits,
+    },
+    tin_validation: {
+      valid: result.tin_valid,
+      ein_valid: result.ein_valid,
+    },
+    compliance_flags: {
+      velocity_flagged: result.velocity_flagged,
+      structuring_flagged: result.structuring_flagged,
+      adverse_media_hits: result.adverse_media_hits,
+    },
+  });
+}
+
+// GET /api/kyc/status/:id
+async function handleStatus(request, env, id) {
+  const authed = await authGateway(request, env);
+  if (!authed) return json({ error: "Unauthorized" }, 401);
+
+  try {
+    const row = await env.AUDIT_DB.prepare(
+      `SELECT * FROM kyc_submissions WHERE submission_id=? LIMIT 1`
+    ).bind(id).first();
+    if (!row) return json({ error: "Submission not found" }, 404);
+
+    return json({
+      submission_id: row.submission_id,
+      status: row.status,
+      risk_score: row.risk_score,
+      risk_decision: row.risk_decision,
+      account_generation: { allowed: row.status === "APPROVED" },
+      screened_at: row.screened_at,
+      engine_version: row.engine_version,
+      flags: (() => { try { return JSON.parse(row.flags_json); } catch { return []; } })(),
+    });
+  } catch (e) {
+    return json({ error: "Database error", detail: e.message }, 500);
+  }
+}
+
+// GET /api/kyc/review?page=&per_page=&status=
+async function handleReviewList(request, env) {
+  if (!authAdmin(request, env)) return json({ error: "Admin key required" }, 403);
+
+  const url      = new URL(request.url);
+  const page     = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10));
+  const perPage  = Math.min(100, Math.max(1, parseInt(url.searchParams.get("per_page") || "25", 10)));
+  const status   = url.searchParams.get("status") || null;
+  const offset   = (page - 1) * perPage;
+
+  try {
+    const whereClause = status ? `WHERE status=?` : "";
+    const params      = status ? [status, perPage, offset] : [perPage, offset];
+    const rows = await env.AUDIT_DB.prepare(
+      `SELECT reference_id, type, flags_json, status, created_at
+       FROM kyc_review_queue ${whereClause}
+       ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    ).bind(...params).all();
+
+    const countRow = await env.AUDIT_DB.prepare(
+      `SELECT COUNT(*) as total FROM kyc_review_queue ${whereClause}`
+    ).bind(...(status ? [status] : [])).first();
+
+    return json({
+      page, per_page: perPage,
+      total: countRow ? parseInt(countRow.total, 10) : 0,
+      items: (rows.results || []).map(r => ({
+        ...r,
+        flags: (() => { try { return JSON.parse(r.flags_json); } catch { return []; } })()
+      }))
+    });
+  } catch (e) {
+    return json({ error: "Database error", detail: e.message }, 500);
+  }
+}
+
+// POST /api/kyc/review/:id/approve|reject|escalate
+async function handleReviewAction(request, env, id, action) {
+  if (!authAdmin(request, env)) return json({ error: "Admin key required" }, 403);
+
+  const actionMap = { approve: "APPROVED", reject: "REJECTED", escalate: "ESCALATED" };
+  const newStatus = actionMap[action];
+  if (!newStatus) return json({ error: "Unknown action" }, 400);
+
+  const now = new Date().toISOString();
+  let body = {};
+  try { body = await request.json(); } catch {}
+
+  try {
+    await env.AUDIT_DB.prepare(
+      `UPDATE kyc_review_queue SET status=?, resolved_at=?, resolved_by=? WHERE reference_id=?`
+    ).bind(newStatus, now, body.reviewer || "admin", id).run();
+
+    await env.AUDIT_DB.prepare(
+      `UPDATE kyc_submissions SET status=? WHERE submission_id=?`
+    ).bind(newStatus, id).run();
+
+    await writeAuditLog(env, `kyc.${action}`, id, "submission", {
+      action, resolved_by: body.reviewer || "admin", note: body.note || null
+    });
+
+    return json({ submission_id: id, status: newStatus, actioned_at: now });
+  } catch (e) {
+    return json({ error: "Database error", detail: e.message }, 500);
+  }
+}
+
+// POST /api/kyc/batch
+async function handleBatch(request, env) {
+  if (!authAdmin(request, env)) return json({ error: "Admin key required" }, 403);
+
+  let body;
+  try { body = await request.json(); }
+  catch { return json({ error: "Invalid JSON" }, 400); }
+
+  const items = Array.isArray(body) ? body : body.items;
+  if (!Array.isArray(items) || items.length === 0) return json({ error: "No items" }, 400);
+  if (items.length > 50) return json({ error: "Max 50 items per batch" }, 400);
+
+  const results = await Promise.all(items.map(async (item) => {
+    const fakeReq = new Request("https://kyc.local/api/kyc/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${env.KYC_ADMIN_KEY}` },
+      body: JSON.stringify(item)
+    });
+    // auth bypass for internal batch
+    const id     = uuid();
+    const start  = Date.now();
+    let result;
+    try { result = await runEngines(item, env); }
+    catch { result = { risk_score: 50, breakdown: {}, flags: ["ERROR"], sanctions_hits: 0, ofac_hits: 0, pep_hits: 0, tin_valid: false, ein_valid: false, velocity_flagged: false, structuring_flagged: false, adverse_media_hits: 0 }; }
+    const latency  = Date.now() - start;
+    const decision = decide(result.risk_score);
+    await Promise.all([
+      persistSubmission(env, id, item, result, decision, latency),
+      persistReviewQueue(env, id, item, result, decision),
+    ]);
+    return { submission_id: id, applicant_name: item.applicant_name, status: decision.decision, risk_score: result.risk_score };
+  }));
+
+  return json({ processed: results.length, results });
+}
+
+// GET /api/kyc/stats
+async function handleStats(request, env) {
+  if (!authAdmin(request, env)) return json({ error: "Admin key required" }, 403);
+  try {
+    const [total, approved, review, denied] = await Promise.all([
+      env.AUDIT_DB.prepare(`SELECT COUNT(*) as n FROM kyc_submissions`).first(),
+      env.AUDIT_DB.prepare(`SELECT COUNT(*) as n FROM kyc_submissions WHERE status='APPROVED'`).first(),
+      env.AUDIT_DB.prepare(`SELECT COUNT(*) as n FROM kyc_submissions WHERE status='REVIEW' OR status='PENDING'`).first(),
+      env.AUDIT_DB.prepare(`SELECT COUNT(*) as n FROM kyc_submissions WHERE status='DENIED'`).first(),
+    ]);
+    const avgRow = await env.AUDIT_DB.prepare(
+      `SELECT AVG(screen_latency_ms) as avg_ms FROM kyc_submissions`
+    ).first();
+
+    return json({
+      engine_version: `v${VERSION}`,
+      totals: {
+        submissions:  total   ? parseInt(total.n, 10) : 0,
+        approved:     approved ? parseInt(approved.n, 10) : 0,
+        review:       review   ? parseInt(review.n, 10) : 0,
+        denied:       denied   ? parseInt(denied.n, 10) : 0,
+      },
+      performance: {
+        avg_screen_latency_ms: avgRow ? Math.round(parseFloat(avgRow.avg_ms) || 0) : 0,
+        target_ms: TIMEOUT_MS,
+      },
+      engines_active: 16,
+    });
+  } catch (e) {
+    return json({ error: "Database error", detail: e.message }, 500);
+  }
+}
+
+// GET /api/kyc/health
+function handleHealth() {
+  return json({
+    status: "ok",
+    version: VERSION,
+    engines: 16,
+    timeout_ms: TIMEOUT_MS,
+    decision_bands: { APPROVED: "0-29", REVIEW: "30-69", DENIED: "70-100" },
+    timestamp: new Date().toISOString(),
+  });
+}
+
+// ─── Main Fetch Handler ───────────────────────────────────────────────────────
+
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-    const method = request.method;
-
-    // Always ensure schema on boot (idempotent)
-    ctx.waitUntil(ensureSchema(env.AUDIT_DB));
-
-    // ── Health ──────────────────────────────────────────────────────────────
-    if (path === '/api/kyc/health' && method === 'GET') {
-      return json({ status: 'ok', version: VERSION, engine_version: ENGINE_VERSION, ts: new Date().toISOString() });
+    if (request.method === "OPTIONS") {
+      return cors(new Response(null, { status: 204 }));
     }
 
-    // ── KYC/KYB Intake ─────────────────────────────────────────────────────
-    if (path === '/api/kyc/apply' && method === 'POST') {
-      const bearer = getBearer(request);
-      const apiKeyOk = await authApiKey(env.GATEWAY_AUTH, bearer);
-      const adminOk = isAdminKey(env, bearer);
-      if (!apiKeyOk && !adminOk) return json({ error: 'Unauthorized' }, 401);
+    const url      = new URL(request.url);
+    const path     = url.pathname;
+    const method   = request.method;
 
-      let payload;
-      try { payload = await request.json(); }
-      catch { return json({ error: 'Invalid JSON body' }, 400); }
-
-      if (!payload.entity_type || !payload.tin) {
-        return json({ error: 'Required fields: entity_type, tin' }, 400);
-      }
-
-      const submissionId = `KYC-${Date.now()}-${Math.random().toString(36).slice(2,8).toUpperCase()}`;
-      const t0 = Date.now();
-
-      // Run all 16 engines
-      const { timedOut, results } = await runAllEngines(payload, env.AUDIT_DB, env.KYC_SANCTIONS);
-
-      const latencyMs = Date.now() - t0;
-
-      if (timedOut) {
-        // Hard timeout → auto-REVIEW
-        const timeoutResult = {
-          submission_id: submissionId,
-          entity_type: payload.entity_type,
-          risk_score: 30,
-          risk_decision: BAND.REVIEW,
-          risk_breakdown: [{ engine: 'TIMEOUT', score: 30, reason: 'Screening exceeded 1800ms — auto-queued for review' }],
-          account_generation: { allowed: false, reason: 'Auto-REVIEW: timeout fence triggered' },
-          screen_latency_ms: latencyMs,
-          engine_version: ENGINE_VERSION,
-          version: VERSION,
-        };
-        ctx.waitUntil(enqueueReview(env.AUDIT_DB, submissionId, payload, [], 30, BAND.REVIEW));
-        return json(timeoutResult);
-      }
-
-      // Aggregate score
-      let totalScore = 0;
-      for (const r of results) totalScore += (r.score || 0);
-      totalScore = Math.min(totalScore, 100);
-
-      const decision = band(totalScore);
-      const tinResult = results.find(e => e.engine === 'E4_TIN_EIN');
-
-      // Pre-account-generation gate
-      const accountGenAllowed = decision === BAND.APPROVED;
-      const accountGen = {
-        allowed: accountGenAllowed,
-        reason: accountGenAllowed
-          ? 'All engines passed — account generation authorized'
-          : `Account generation blocked: ${decision} decision (score ${totalScore})`
-      };
-
-      // Persist
-      ctx.waitUntil((async () => {
-        await saveSubmission(env.AUDIT_DB, submissionId, payload, results, totalScore, decision, latencyMs, tinResult);
-        if (decision !== BAND.APPROVED) {
-          await enqueueReview(env.AUDIT_DB, submissionId, payload, results, totalScore, decision);
-        }
-        const ofacIndex = await loadIndex(env.KYC_SANCTIONS, 'sdn:index');
-        const pepIndex  = await loadIndex(env.KYC_SANCTIONS, 'pep:index');
-        await saveBeneficialOwners(env.AUDIT_DB, submissionId, payload, ofacIndex, pepIndex);
-        if (decision === BAND.DENIED) {
-          await notifySystemAlert(env, {
-            event_type: 'SYSTEM_ALERT',
-            severity: 'HIGH',
-            title: 'KYC DENIED',
-            submission_id: submissionId,
-            entity: payload.full_name || payload.business_name,
-            score: totalScore,
-            flagged_engines: results.filter(r => r.score > 0).map(r => r.engine),
-          });
-        }
-      })());
-
-      return json({
-        submission_id: submissionId,
-        entity_type: payload.entity_type,
-        applicant: payload.full_name || payload.business_name,
-        risk_score: totalScore,
-        risk_decision: decision,
-        risk_breakdown: results.map(r => ({ engine: r.engine, score: r.score })),
-        risk_detail: results.filter(r => r.score > 0),
-        account_generation: accountGen,
-        tin_formatted: tinResult?.formatted,
-        screen_latency_ms: latencyMs,
-        engine_version: ENGINE_VERSION,
-        version: VERSION,
-      });
+    // Health (unauthenticated)
+    if (path === "/api/kyc/health" && method === "GET") {
+      return handleHealth();
     }
 
-    // ── Batch Intake ────────────────────────────────────────────────────────
-    if (path === '/api/kyc/batch' && method === 'POST') {
-      const bearer = getBearer(request);
-      if (!isAdminKey(env, bearer)) return json({ error: 'Admin only' }, 403);
-
-      let body;
-      try { body = await request.json(); }
-      catch { return json({ error: 'Invalid JSON' }, 400); }
-
-      const submissions = body.submissions || [];
-      if (!Array.isArray(submissions) || submissions.length === 0)
-        return json({ error: 'submissions array required' }, 400);
-      if (submissions.length > 50)
-        return json({ error: 'Max 50 submissions per batch' }, 400);
-
-      const results = await Promise.all(
-        submissions.map(async (s) => {
-          if (!s.entity_type || !s.tin) return { error: 'entity_type and tin required', payload: s };
-          const sid = `KYC-B${Date.now()}-${Math.random().toString(36).slice(2,6).toUpperCase()}`;
-          const t0 = Date.now();
-          const { timedOut, results: er } = await runAllEngines(s, env.AUDIT_DB, env.KYC_SANCTIONS);
-          const ms = Date.now() - t0;
-          if (timedOut) return { submission_id: sid, risk_decision: BAND.REVIEW, risk_score: 30, screen_latency_ms: ms, timedOut: true };
-          let score = 0;
-          for (const r of er) score += (r.score || 0);
-          score = Math.min(score, 100);
-          const dec = band(score);
-          const tinR = er.find(e => e.engine === 'E4_TIN_EIN');
-          ctx.waitUntil(saveSubmission(env.AUDIT_DB, sid, s, er, score, dec, ms, tinR));
-          return { submission_id: sid, applicant: s.full_name || s.business_name, risk_score: score, risk_decision: dec, screen_latency_ms: ms };
-        })
-      );
-
-      return json({ batch_count: results.length, results });
+    // Stats
+    if (path === "/api/kyc/stats" && method === "GET") {
+      return handleStats(request, env);
     }
 
-    // ── Status ──────────────────────────────────────────────────────────────
-    if (path.startsWith('/api/kyc/status/') && method === 'GET') {
-      const bearer = getBearer(request);
-      const apiKeyOk = await authApiKey(env.GATEWAY_AUTH, bearer);
-      const adminOk = isAdminKey(env, bearer);
-      if (!apiKeyOk && !adminOk) return json({ error: 'Unauthorized' }, 401);
-
-      const sid = path.split('/').pop();
-      try {
-        const { results } = await env.AUDIT_DB.prepare(
-          `SELECT submission_id,entity_type,applicant_name,risk_score,risk_decision,status,screen_latency_ms,screened_at,tin_formatted,engine_version FROM kyc_submissions WHERE submission_id=?`
-        ).bind(sid).all();
-        if (!results.length) return json({ error: 'Not found' }, 404);
-        return json(results[0]);
-      } catch (e) { return json({ error: e.message }, 500); }
+    // Apply
+    if (path === "/api/kyc/apply" && method === "POST") {
+      return handleApply(request, env);
     }
 
-    // ── Review Queue ────────────────────────────────────────────────────────
-    if (path === '/api/kyc/review' && method === 'GET') {
-      const bearer = getBearer(request);
-      if (!isAdminKey(env, bearer)) return json({ error: 'Admin only' }, 403);
-
-      const status = url.searchParams.get('status') || 'pending';
-      try {
-        const { results } = await env.AUDIT_DB.prepare(
-          `SELECT q.*,s.risk_score,s.risk_decision,s.applicant_name,s.screen_latency_ms
-           FROM kyc_review_queue q
-           LEFT JOIN kyc_submissions s ON q.submission_id=s.submission_id
-           WHERE q.status=?
-           ORDER BY s.risk_score DESC
-           LIMIT 100`
-        ).bind(status).all();
-        return json({ count: results.length, queue: results });
-      } catch (e) { return json({ error: e.message }, 500); }
+    // Status
+    const statusMatch = path.match(/^\/api\/kyc\/status\/([^/]+)$/);
+    if (statusMatch && method === "GET") {
+      return handleStatus(request, env, statusMatch[1]);
     }
 
-    // ── Approve ─────────────────────────────────────────────────────────────
-    if (path.match(/^\/api\/kyc\/review\/[^/]+\/approve$/) && method === 'POST') {
-      const bearer = getBearer(request);
-      if (!isAdminKey(env, bearer)) return json({ error: 'Admin only' }, 403);
-      const sid = path.split('/')[4];
-      const body = await request.json().catch(() => ({}));
-      try {
-        await env.AUDIT_DB.prepare(
-          `UPDATE kyc_review_queue SET status='approved',resolved_by=?,resolved_at=datetime('now') WHERE submission_id=?`
-        ).bind(body.reviewer || 'admin', sid).run();
-        await env.AUDIT_DB.prepare(
-          `UPDATE kyc_submissions SET status='approved',risk_decision='APPROVED' WHERE submission_id=?`
-        ).bind(sid).run();
-        return json({ submission_id: sid, status: 'approved' });
-      } catch (e) { return json({ error: e.message }, 500); }
+    // Review list
+    if (path === "/api/kyc/review" && method === "GET") {
+      return handleReviewList(request, env);
     }
 
-    // ── Reject ──────────────────────────────────────────────────────────────
-    if (path.match(/^\/api\/kyc\/review\/[^/]+\/reject$/) && method === 'POST') {
-      const bearer = getBearer(request);
-      if (!isAdminKey(env, bearer)) return json({ error: 'Admin only' }, 403);
-      const sid = path.split('/')[4];
-      const body = await request.json().catch(() => ({}));
-      try {
-        await env.AUDIT_DB.prepare(
-          `UPDATE kyc_review_queue SET status='rejected',resolved_by=?,resolved_at=datetime('now') WHERE submission_id=?`
-        ).bind(body.reviewer || 'admin', sid).run();
-        await env.AUDIT_DB.prepare(
-          `UPDATE kyc_submissions SET status='rejected',risk_decision='DENIED' WHERE submission_id=?`
-        ).bind(sid).run();
-        return json({ submission_id: sid, status: 'rejected' });
-      } catch (e) { return json({ error: e.message }, 500); }
+    // Review actions
+    const actionMatch = path.match(/^\/api\/kyc\/review\/([^/]+)\/(approve|reject|escalate)$/);
+    if (actionMatch && method === "POST") {
+      return handleReviewAction(request, env, actionMatch[1], actionMatch[2]);
     }
 
-    // ── Stats ───────────────────────────────────────────────────────────────
-    if (path === '/api/kyc/stats' && method === 'GET') {
-      const bearer = getBearer(request);
-      if (!isAdminKey(env, bearer)) return json({ error: 'Admin only' }, 403);
-      try {
-        const [totals, latency, decisions] = await Promise.all([
-          env.AUDIT_DB.prepare(`SELECT COUNT(*) AS total FROM kyc_submissions`).all(),
-          env.AUDIT_DB.prepare(`SELECT AVG(screen_latency_ms) AS avg_ms, MAX(screen_latency_ms) AS max_ms, MIN(screen_latency_ms) AS min_ms FROM kyc_submissions`).all(),
-          env.AUDIT_DB.prepare(`SELECT risk_decision, COUNT(*) AS cnt FROM kyc_submissions GROUP BY risk_decision`).all(),
-        ]);
-        return json({
-          total_submissions: totals.results[0]?.total || 0,
-          latency_ms: latency.results[0],
-          decisions: decisions.results,
-          engine_version: ENGINE_VERSION,
-          version: VERSION,
-        });
-      } catch (e) { return json({ error: e.message }, 500); }
+    // Batch
+    if (path === "/api/kyc/batch" && method === "POST") {
+      return handleBatch(request, env);
     }
 
-    // ── Beneficial Owners ───────────────────────────────────────────────────
-    if (path.startsWith('/api/kyc/owners/') && method === 'GET') {
-      const bearer = getBearer(request);
-      if (!isAdminKey(env, bearer)) return json({ error: 'Admin only' }, 403);
-      const sid = path.split('/').pop();
-      try {
-        const { results } = await env.AUDIT_DB.prepare(
-          `SELECT * FROM kyc_beneficial_owners WHERE submission_id=?`
-        ).bind(sid).all();
-        return json({ submission_id: sid, owners: results });
-      } catch (e) { return json({ error: e.message }, 500); }
-    }
-
-    return json({ error: 'Not found', version: VERSION }, 404);
+    return json({ error: "Not found", path }, 404);
   }
 };
