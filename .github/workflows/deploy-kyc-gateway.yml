@@ -1,4 +1,4 @@
-name: Deploy kyc-gateway v8
+name: Deploy kyc-gateway v8.1
 
 on:
   push:
@@ -17,7 +17,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Run unit tests (100 assertions)
+      - name: Run unit tests (179 assertions)
         run: node kyc-gateway/unit_test.js
 
   deploy:
@@ -31,7 +31,7 @@ jobs:
           node-version: '22'
       - name: Install Wrangler
         run: npm install -g wrangler@latest
-      - name: Deploy kyc-gateway v8.0
+      - name: Deploy kyc-gateway v8.1
         working-directory: kyc-gateway
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
