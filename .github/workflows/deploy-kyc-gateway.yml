@@ -2,7 +2,7 @@ name: Deploy kyc-gateway v7
 
 on:
   push:
-    branches: [main, kyc-gateway-v7]
+    branches: [main]
     paths:
       - 'kyc-gateway/**'
       - '.github/workflows/deploy-kyc-gateway.yml'
@@ -13,12 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Use Node.js 20
+      - name: Use Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-
+          node-version: '22'
       - name: Run unit tests
         run: node kyc-gateway/unit_test.js
 
@@ -27,28 +25,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Use Node.js 20
+      - name: Use Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-
+          node-version: '22'
       - name: Install Wrangler
         run: npm install -g wrangler@latest
-
       - name: Deploy kyc-gateway v7
         working-directory: kyc-gateway
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: fd6f05d3bbca4cc5f175ca4f7154552b
         run: wrangler deploy worker.js --name kyc-gateway --compatibility-date 2026-09-02
-
       - name: Seed KV sanctions lists
         env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: node kyc-gateway/seed_kv.js
-
       - name: Health check
-        run: |
-          sleep 3
-          curl -sf https://kyc.wwwknockoutforever.com/api/kyc/health || true
+        run: sleep 4 && curl -sf https://kyc.wwwknockoutforever.com/api/kyc/health || echo "Health check pending"
