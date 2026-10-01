@@ -11,9 +11,10 @@ binding = "VECTORIZE"
 index_name = "ai-search-index"
 
 [[d1_databases]]
-binding = "SEARCH_DB"
+binding   = "SEARCH_DB"
 database_name = "bervashun-audit"
-database_id = "f2fe6105-b552-42b4-a2ca-9d2a349861da"
+database_id   = "f2fe6105-b552-42b4-a2ca-9d2a349861da"
 
-[vars]
-WORKER_VERSION = "3.0.0"
+[[routes]]
+pattern = "ai-search.wwwknockoutforever.com/*"
+zone_name = "wwwknockoutforever.com"
