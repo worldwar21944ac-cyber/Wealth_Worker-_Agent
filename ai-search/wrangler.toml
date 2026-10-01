@@ -1,8 +1,7 @@
-name            = "ai-search"
-main            = "worker.js"
+name = "ai-search"
+main = "worker.js"
 compatibility_date = "2026-09-02"
 compatibility_flags = ["nodejs_compat"]
-
 account_id = "fd6f05d3bbca4cc5f175ca4f7154552b"
 
 [ai]
@@ -13,13 +12,15 @@ binding = "VECTORIZE"
 index_name = "ai-search-index"
 
 [[d1_databases]]
-binding   = "SEARCH_DB"
+binding       = "SEARCH_DB"
 database_name = "bervashun-audit"
 database_id   = "f2fe6105-b552-42b4-a2ca-9d2a349861da"
 
+[limits]
+cpu_ms = 30000
+
 [vars]
-# Non-secret vars (override with secrets in production)
 SERVICE_NAME = "ai-search"
 VERSION      = "2.0"
 
-# Secret: SEARCH_ADMIN_KEY — set via: wrangler secret put SEARCH_ADMIN_KEY
+# Secret: SEARCH_ADMIN_KEY — set via CI or: wrangler secret put SEARCH_ADMIN_KEY
