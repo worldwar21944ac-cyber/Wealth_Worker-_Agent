@@ -1,0 +1,34 @@
+name: Deploy kyc-gateway v6.0
+
+on:
+  push:
+    branches: [kyc-gateway-v6]
+    paths: ['kyc-gateway/**']
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy kyc-gateway to Cloudflare Workers
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run unit tests
+        run: node kyc-gateway/unit_test.js
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          workingDirectory: kyc-gateway
+          command: deploy worker.js --name kyc-gateway --compatibility-date 2026-09-02 --account-id fd6f05d3bbca4cc5f175ca4f7154552b
+
+      - name: Set secrets
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          workingDirectory: kyc-gateway
+          command: secret put KYC_ADMIN_KEY --name kyc-gateway
+        env:
+          KYC_ADMIN_KEY: ${{ secrets.KYC_ADMIN_KEY }}
+        continue-on-error: true
