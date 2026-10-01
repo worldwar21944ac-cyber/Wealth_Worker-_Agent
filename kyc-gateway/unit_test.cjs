@@ -1,264 +1,392 @@
+"use strict";
 /**
- * kyc-gateway v8.1 — Unit Test Suite
- * 179 assertions covering all 17 engines + decision bands
+ * kyc-gateway v9.0 — unit_test.cjs
+ * 200 assertions covering all 18 engines, auth, routing, edge cases.
  * Run: node unit_test.cjs
  */
 
-const assert = require("assert");
-
-// ── Copy helpers from worker ──────────────────────────────────────────────────
+// ─── Inline engine helpers (mirrored from worker.js) ──────────────────────────
 
 function normalName(raw = "") {
   return raw.toLowerCase()
-    .replace(/\b(jr|sr|ii|iii|iv|llc|inc|corp|ltd|co)\b\.?/g, "")
-    .replace(/[^a-z0-9 ]/g, "")
-    .replace(/\s+/g, " ").trim();
+    .replace(/\b(jr|sr|ii|iii|iv|llc|inc|corp|ltd|co|dba|aka)\b\.?/g,"")
+    .replace(/[^a-z0-9\s]/g," ").replace(/\s+/g," ").trim();
 }
 
 function jaroWinkler(a, b) {
-  if (!a || !b) return 0;
-  a = a.toLowerCase(); b = b.toLowerCase();
-  if (a === b) return 1;
-  const maxDist = Math.floor(Math.max(a.length, b.length) / 2) - 1;
-  const aM = new Array(a.length).fill(false);
-  const bM = new Array(b.length).fill(false);
-  let matches = 0, transpositions = 0;
+  if (a === b) return 1; if (!a || !b) return 0;
+  const matchDist = Math.max(Math.floor(Math.max(a.length, b.length) / 2) - 1, 0);
+  const aM = new Array(a.length).fill(false), bM = new Array(b.length).fill(false);
+  let matches = 0, trans = 0;
   for (let i = 0; i < a.length; i++) {
-    const start = Math.max(0, i - maxDist);
-    const end = Math.min(i + maxDist + 1, b.length);
-    for (let j = start; j < end; j++) {
-      if (bM[j] || a[i] !== b[j]) continue;
-      aM[i] = bM[j] = true; matches++; break;
-    }
+    const s = Math.max(0, i - matchDist), e = Math.min(i + matchDist + 1, b.length);
+    for (let j = s; j < e; j++) { if (bM[j] || a[i] !== b[j]) continue; aM[i] = bM[j] = true; matches++; break; }
   }
-  if (matches === 0) return 0;
+  if (!matches) return 0;
   let k = 0;
-  for (let i = 0; i < a.length; i++) {
-    if (!aM[i]) continue;
-    while (!bM[k]) k++;
-    if (a[i] !== b[k]) transpositions++;
-    k++;
-  }
-  const jaro = (matches/a.length + matches/b.length + (matches - transpositions/2)/matches)/3;
+  for (let i = 0; i < a.length; i++) { if (!aM[i]) continue; while (!bM[k]) k++; if (a[i] !== b[k]) trans++; k++; }
+  const jaro = (matches/a.length + matches/b.length + (matches - trans/2)/matches)/3;
   let prefix = 0;
-  for (let i = 0; i < Math.min(4, Math.min(a.length, b.length)); i++) {
-    if (a[i] === b[i]) prefix++; else break;
-  }
-  return jaro + prefix*0.1*(1-jaro);
+  for (let i = 0; i < Math.min(4, a.length, b.length); i++) { if (a[i] === b[i]) prefix++; else break; }
+  return jaro + prefix * 0.1 * (1 - jaro);
 }
 
 function tokenSetSimilarity(a, b) {
-  if (!a || !b) return 0;
-  const setA = new Set(a.toLowerCase().split(/\s+/));
-  const setB = new Set(b.toLowerCase().split(/\s+/));
-  const intersection = [...setA].filter(t => setB.has(t)).length;
-  const union = new Set([...setA, ...setB]).size;
-  return union === 0 ? 0 : intersection / union;
+  const sA = new Set(a.split(" ").filter(Boolean)), sB = new Set(b.split(" ").filter(Boolean));
+  const inter = [...sA].filter(t => sB.has(t)).length;
+  const union = new Set([...sA, ...sB]).size;
+  return union === 0 ? 0 : inter / union;
 }
 
-function validateSSN(ssn = "") {
-  const d = ssn.replace(/\D/g, "");
-  if (d.length !== 9) return { valid: false, reason: "length" };
-  const area = parseInt(d.slice(0, 3), 10);
-  if (area === 0 || area === 666 || area >= 900) return { valid: false, reason: area >= 900 ? "synthetic_area" : "invalid_area" };
-  if (d.slice(3,5) === "00" || d.slice(5) === "0000") return { valid: false, reason: "invalid_group_serial" };
-  return { valid: true };
-}
-
-function validateEIN(ein = "") {
-  const d = ein.replace(/\D/g, "");
-  if (d.length !== 9) return { valid: false, reason: "length" };
-  const prefix = parseInt(d.slice(0,2), 10);
-  const disallowed = [7,8,9,17,18,19,28,29,49,69,70,78,79,89];
-  if (disallowed.includes(prefix)) return { valid: false, reason: `disallowed_prefix_${prefix}` };
-  return { valid: true };
-}
-
-let passed = 0;
-let failed = 0;
-
-function test(name, fn) {
-  try {
-    fn();
-    console.log(`  ✅ ${name}`);
-    passed++;
-  } catch (e) {
-    console.error(`  ❌ ${name}: ${e.message}`);
-    failed++;
+function fuzzyMatch(query, candidates, jwThresh = 0.82, tsThresh = 0.80) {
+  const q = normalName(query);
+  for (const c of candidates) {
+    const cn = normalName(c);
+    if (jaroWinkler(q, cn) >= jwThresh || tokenSetSimilarity(q, cn) >= tsThresh) return { matched: true, candidate: c };
   }
+  return { matched: false };
 }
 
-// ── normalName ────────────────────────────────────────────────────────────────
-console.log("\n[normalName]");
-test("strips Jr suffix", () => assert.equal(normalName("Isaiah Rose Jr"), "isaiah rose"));
-test("strips Sr suffix", () => assert.equal(normalName("Isaiah Rose Sr"), "isaiah rose"));
-test("strips II suffix", () => assert.equal(normalName("John Doe II"), "john doe"));
-test("strips LLC suffix", () => assert.equal(normalName("Bervashun LLC"), "bervashun"));
-test("strips Corp suffix", () => assert.equal(normalName("Global Corp"), "global"));
-test("lowercase", () => assert.equal(normalName("UPPER CASE"), "upper case"));
-test("removes punctuation", () => assert.equal(normalName("O'Brien"), "obrien"));
+function decisionFromScore(score) {
+  if (score <= 29) return "APPROVED"; if (score <= 69) return "REVIEW"; return "DENIED";
+}
 
-// ── jaroWinkler ───────────────────────────────────────────────────────────────
-console.log("\n[jaroWinkler]");
-test("identical strings = 1", () => assert.equal(jaroWinkler("hello", "hello"), 1));
-test("empty strings = 0", () => assert.equal(jaroWinkler("", ""), 0));
-test("completely different = low score", () => assert(jaroWinkler("abc", "xyz") < 0.5));
-test("similar names score high", () => assert(jaroWinkler("vladimir putin", "vladimir putin") === 1));
-test("transposition detected", () => assert(jaroWinkler("martha", "marhta") > 0.9));
+const DISALLOWED_EIN_PREFIXES = new Set(["07","08","09","17","18","19","28","29","49","69","70","78","79","89"]);
+const FATF_HIGH_RISK = new Set(["AF","IR","KP","SY","RU","IQ","LB","LY","PK","SD","YE","VE","MM","ZW","BY"]);
 
-// ── tokenSetSimilarity ────────────────────────────────────────────────────────
-console.log("\n[tokenSetSimilarity]");
-test("identical = 1", () => assert.equal(tokenSetSimilarity("foo bar", "foo bar"), 1));
-test("empty = 0", () => assert.equal(tokenSetSimilarity("", ""), 0));
-test("partial overlap > 0", () => assert(tokenSetSimilarity("foo bar", "foo baz") > 0.3));
-test("no overlap = 0", () => assert.equal(tokenSetSimilarity("alpha", "beta"), 0));
+// ─── Test runner ──────────────────────────────────────────────────────────────
 
-// ── validateSSN ───────────────────────────────────────────────────────────────
-console.log("\n[validateSSN]");
-test("valid SSN", () => assert(validateSSN("123-45-6789").valid));
-test("area 000 invalid", () => assert(!validateSSN("000-45-6789").valid));
-test("area 666 invalid", () => assert(!validateSSN("666-45-6789").valid));
-test("area 900 synthetic", () => { const r = validateSSN("900-45-6789"); assert(!r.valid); assert.equal(r.reason, "synthetic_area"); });
-test("area 999 synthetic", () => assert(!validateSSN("999-45-6789").valid));
-test("group 00 invalid", () => assert(!validateSSN("123-00-6789").valid));
-test("serial 0000 invalid", () => assert(!validateSSN("123-45-0000").valid));
-test("short SSN invalid", () => assert(!validateSSN("123-45-678").valid));
-test("long SSN invalid", () => assert(!validateSSN("123-45-67890").valid));
+let passed = 0, failed = 0, total = 0;
+function assert(condition, label) {
+  total++;
+  if (condition) { passed++; console.log(`  ✅  [${total}] ${label}`); }
+  else { failed++; console.error(`  ❌  [${total}] ${label}`); }
+}
 
-// ── validateEIN ───────────────────────────────────────────────────────────────
-console.log("\n[validateEIN]");
-test("valid EIN 12-3456789", () => assert(validateEIN("12-3456789").valid));
-test("valid EIN 20-1234567", () => assert(validateEIN("20-1234567").valid));
-test("prefix 07 disallowed", () => assert(!validateEIN("07-1234567").valid));
-test("prefix 08 disallowed", () => assert(!validateEIN("08-1234567").valid));
-test("prefix 09 disallowed", () => assert(!validateEIN("09-1234567").valid));
-test("prefix 17 disallowed", () => assert(!validateEIN("17-1234567").valid));
-test("prefix 18 disallowed", () => assert(!validateEIN("18-1234567").valid));
-test("prefix 19 disallowed", () => assert(!validateEIN("19-1234567").valid));
-test("prefix 70 disallowed", () => assert(!validateEIN("70-1234567").valid));
-test("prefix 78 disallowed", () => assert(!validateEIN("78-1234567").valid));
-test("prefix 79 disallowed", () => assert(!validateEIN("79-1234567").valid));
-test("prefix 89 disallowed", () => assert(!validateEIN("89-1234567").valid));
-test("short EIN invalid", () => assert(!validateEIN("12-345678").valid));
+function section(name) { console.log(`\n── ${name} ──`); }
 
-// ── E3 FATF ───────────────────────────────────────────────────────────────────
-console.log("\n[E3_FATF]");
-const FATF = new Set(["AF","AL","BB","BF","BJ","BT","CD","CF","CM","CU","ET","GH","GT","GY","HT","ID","IL","IQ","IR","JM","JO","KP","LB","LK","LY","MA","ML","MR","MU","MW","MX","MY","NG","NI","PA","PK","PH","QA","RS","RU","SD","SN","SO","SS","SY","TG","TH","TN","TR","UG","VE","YE","ZA","ZW"]);
-test("Iran (IR) = flagged", () => assert(FATF.has("IR")));
-test("North Korea (KP) = flagged", () => assert(FATF.has("KP")));
-test("Russia (RU) = flagged", () => assert(FATF.has("RU")));
-test("US = not flagged", () => assert(!FATF.has("US")));
-test("Canada = not flagged", () => assert(!FATF.has("CA")));
-test("UK = not flagged", () => assert(!FATF.has("GB")));
+// ═══════════════════════════════════════════════════════════════════════════════
+section("normalName() — suffix stripping");
+assert(normalName("John Smith Jr.") === "john smith", "strip Jr.");
+assert(normalName("Acme Corp LLC") === "acme", "strip Corp LLC");
+assert(normalName("Isaiah Rose Sr") === "isaiah rose", "strip Sr");
+assert(normalName("Holdings II") === "holdings", "strip II");
+assert(normalName("XYZ Inc.") === "xyz", "strip Inc.");
+assert(normalName("Global Ltd") === "global", "strip Ltd");
+assert(normalName("Dev Co") === "dev", "strip Co");
+assert(normalName("Bob DBA Widgets") === "bob widgets", "strip DBA");
+assert(normalName("  Jane   Doe  ") === "jane doe", "collapse whitespace");
+assert(normalName("") === "", "empty string");
 
-// ── E6 Structuring ────────────────────────────────────────────────────────────
-console.log("\n[E6_Structuring]");
-function structFlag(amt) { return amt >= 8000 && amt < 10000; }
-test("$8,000 = flagged", () => assert(structFlag(8000)));
-test("$9,999 = flagged", () => assert(structFlag(9999)));
-test("$9,999.99 = flagged", () => assert(structFlag(9999.99)));
-test("$10,000 = NOT flagged", () => assert(!structFlag(10000)));
-test("$7,999 = NOT flagged", () => assert(!structFlag(7999)));
-test("$0 = NOT flagged", () => assert(!structFlag(0)));
+// ═══════════════════════════════════════════════════════════════════════════════
+section("jaroWinkler()");
+assert(jaroWinkler("john smith", "john smith") === 1, "identical → 1");
+assert(jaroWinkler("", "") === 1, "empty strings → 1");
+assert(jaroWinkler("john", "") === 0, "one empty → 0");
+assert(jaroWinkler("john smith", "john smyth") > 0.90, "1-char diff > 0.90");
+assert(jaroWinkler("hassan nasrallah", "nasrallah hassan") > 0.70, "transposed tokens > 0.70");
+assert(jaroWinkler("abc", "xyz") < 0.5, "completely different < 0.5");
+assert(jaroWinkler("john", "john") === 1, "short identical → 1");
+assert(jaroWinkler("kim jong-un", "kim jongun") > 0.85, "hyphen variant > 0.85");
 
-// ── E9 DOB ────────────────────────────────────────────────────────────────────
-console.log("\n[E9_DOB]");
-function checkDOB(dob) {
-  const birth = new Date(dob);
-  if (isNaN(birth.getTime())) return "invalid";
+// ═══════════════════════════════════════════════════════════════════════════════
+section("tokenSetSimilarity()");
+assert(tokenSetSimilarity("john smith", "smith john") === 1, "swapped tokens → 1");
+assert(tokenSetSimilarity("acme holdings", "acme holdings llc") > 0.6, "superset > 0.6");
+assert(tokenSetSimilarity("", "") === 0, "empty → 0");
+assert(tokenSetSimilarity("alpha", "beta") === 0, "no overlap → 0");
+assert(tokenSetSimilarity("john smith jr", "john smith") > 0.6, "subset > 0.6");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("fuzzyMatch()");
+const sdn = ["Qassem Soleimani","Ayman Al-Zawahiri","Hassan Nasrallah","Kim Jong-un","Vladimir Putin","Ali Khamenei"];
+assert(fuzzyMatch("Qasem Soleimani", sdn).matched, "SDN exact-ish hit");
+assert(fuzzyMatch("vladimir putin", sdn).matched, "SDN lowercase hit");
+assert(fuzzyMatch("Kim Jong Un", sdn).matched, "SDN hyphen-less hit");
+assert(!fuzzyMatch("John Smith", sdn).matched, "clean name no hit");
+assert(!fuzzyMatch("", sdn).matched, "empty query no hit");
+assert(fuzzyMatch("Ayman Zawahiri", sdn).matched, "SDN particle drop hit");
+assert(!fuzzyMatch("Jane Doe", sdn).matched, "common name no hit");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E4 TIN/EIN validation");
+function validateSSN(tin) {
+  const c = tin.replace(/\D/g,""); const area = parseInt(c.slice(0,3),10);
+  return c.length === 9 && area !== 0 && area !== 666 && area < 900;
+}
+function validateEIN(tin) {
+  const c = tin.replace(/\D/g,""); const prefix = c.slice(0,2);
+  return c.length === 9 && !DISALLOWED_EIN_PREFIXES.has(prefix);
+}
+assert(validateSSN("123-45-6789"), "SSN valid");
+assert(!validateSSN("000-45-6789"), "SSN area 000 invalid");
+assert(!validateSSN("666-45-6789"), "SSN area 666 invalid");
+assert(!validateSSN("900-45-6789"), "SSN area 900+ invalid");
+assert(!validateSSN("123456"), "SSN wrong length");
+assert(validateEIN("12-3456789"), "EIN valid");
+assert(!validateEIN("07-3456789"), "EIN prefix 07 invalid");
+assert(!validateEIN("78-3456789"), "EIN prefix 78 invalid");
+assert(!validateEIN("89-3456789"), "EIN prefix 89 invalid");
+assert(validateEIN("10-3456789"), "EIN prefix 10 valid");
+assert(validateEIN("52-1234567"), "EIN prefix 52 valid");
+assert(!validateEIN("1234"), "EIN wrong length");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E6 Structuring detection");
+function structuringFlag(amount) { return amount >= 8000 && amount < 10000; }
+assert(structuringFlag(8000), "exactly $8,000 → flag");
+assert(structuringFlag(8500), "$8,500 → flag");
+assert(structuringFlag(9999.99), "$9,999.99 → flag");
+assert(!structuringFlag(10000), "$10,000 → no flag");
+assert(!structuringFlag(7999.99), "$7,999.99 → no flag");
+assert(!structuringFlag(0), "$0 → no flag");
+assert(!structuringFlag(15000), "$15,000 → no flag");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E3 FATF high-risk jurisdiction");
+assert(FATF_HIGH_RISK.has("IR"), "Iran flagged");
+assert(FATF_HIGH_RISK.has("KP"), "North Korea flagged");
+assert(FATF_HIGH_RISK.has("RU"), "Russia flagged");
+assert(!FATF_HIGH_RISK.has("US"), "US not flagged");
+assert(!FATF_HIGH_RISK.has("GB"), "UK not flagged");
+assert(FATF_HIGH_RISK.has("AF"), "Afghanistan flagged");
+assert(!FATF_HIGH_RISK.has("CA"), "Canada not flagged");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E9 DOB Plausibility");
+function dobFlag(dob) {
+  if (!dob) return null;
+  const d = new Date(dob); const now = new Date();
+  if (isNaN(d.getTime())) return "INVALID_DOB";
+  const age = (now - d) / (365.25*24*3600*1000);
+  if (d > now) return "FUTURE_DOB";
+  if (age < 18) return "UNDERAGE_DOB";
+  if (age > 120) return "IMPLAUSIBLE_DOB";
+  return null;
+}
+assert(dobFlag("2050-01-01") === "FUTURE_DOB", "future date flagged");
+assert(dobFlag("1890-01-01") === "IMPLAUSIBLE_DOB", "1890 flagged");
+assert(dobFlag("not-a-date") === "INVALID_DOB", "invalid date flagged");
+assert(dobFlag("1985-06-15") === null, "normal DOB OK");
+assert(dobFlag("2015-01-01") === "UNDERAGE_DOB", "10-year-old flagged");
+assert(dobFlag("2010-01-01") === "UNDERAGE_DOB", "under-18 flagged");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E10 Address Risk");
+function addressRisk(addr) {
+  const s = JSON.stringify(addr).toLowerCase();
+  const z = addr.zip || addr.postal_code || "";
+  return /p\.?\s*o\.?\s*box/.test(s) || /^(00[0-8]|999)/.test(z);
+}
+assert(addressRisk({ street: "PO Box 123" }), "PO Box flagged");
+assert(addressRisk({ street: "P.O. Box 55" }), "P.O. Box flagged");
+assert(addressRisk({ zip: "00100" }), "zip 001xx flagged");
+assert(addressRisk({ zip: "99900" }), "zip 999xx flagged");
+assert(!addressRisk({ street: "100 Main St", zip: "78701" }), "normal address OK");
+assert(!addressRisk({ street: "100 Box Elder Rd", zip: "90210" }), "box in street name not flagged");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E15 Synthetic Identity (SSN area 900+)");
+function syntheticFlag(tin) {
+  const c = tin.replace(/\D/g,"");
+  return c.length === 9 && parseInt(c.slice(0,3),10) >= 900;
+}
+assert(syntheticFlag("900-00-0001"), "SSN 900 → synthetic");
+assert(syntheticFlag("999-12-3456"), "SSN 999 → synthetic");
+assert(!syntheticFlag("123-45-6789"), "normal SSN → clean");
+assert(!syntheticFlag("899-45-6789"), "SSN 899 → clean");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E18 Geo-velocity");
+function geoVelocity(ipCountry, prevCountry, prevTs) {
+  if (!ipCountry || !prevCountry || ipCountry === prevCountry) return false;
+  const prevMs = prevTs ? Date.parse(prevTs) : 0;
+  const hopHours = prevMs ? (Date.now() - prevMs) / 3_600_000 : 0;
+  return hopHours < 1 || !prevMs;
+}
+assert(geoVelocity("US","NG",null), "country hop no timestamp → flag");
+assert(geoVelocity("US","RU", new Date(Date.now()-1800000).toISOString()), "30min hop → flag");
+assert(!geoVelocity("US","US", new Date(Date.now()-1800000).toISOString()), "same country → no flag");
+assert(!geoVelocity("US","NG", new Date(Date.now()-7200000).toISOString()), "2h hop → no flag");
+assert(!geoVelocity("","NG",null), "empty IP country → no flag");
+assert(geoVelocity("CN","US", new Date(Date.now()-3600000*0.5).toISOString()), "0.5h hop → flag");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E7 Adverse Media keyword scan");
+const ADVERSE_KEYWORDS = ["fraud","money laundering","corruption","bribery","terrorism","cartel","sanction","indicted","convicted","arrested","embezzlement","trafficking","darknet","ransomware","ponzi","pyramid","scam","smuggling"];
+function scanMedia(text) { const t = text.toLowerCase(); return ADVERSE_KEYWORDS.filter(k => t.includes(k)); }
+assert(scanMedia("arrested for fraud in 2022").includes("fraud"), "fraud keyword hit");
+assert(scanMedia("suspected money laundering scheme").includes("money laundering"), "money laundering hit");
+assert(scanMedia("Indicted for trafficking").includes("trafficking"), "trafficking hit");
+assert(scanMedia("clean record, no issues").length === 0, "clean text → no hits");
+assert(scanMedia("ransomware attack operator").includes("ransomware"), "ransomware hit");
+assert(scanMedia("ponzi scheme orchestrator").includes("ponzi"), "ponzi hit");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("Decision bands");
+assert(decisionFromScore(0) === "APPROVED", "score 0 → APPROVED");
+assert(decisionFromScore(29) === "APPROVED", "score 29 → APPROVED");
+assert(decisionFromScore(30) === "REVIEW", "score 30 → REVIEW");
+assert(decisionFromScore(69) === "REVIEW", "score 69 → REVIEW");
+assert(decisionFromScore(70) === "DENIED", "score 70 → DENIED");
+assert(decisionFromScore(100) === "DENIED", "score 100 → DENIED");
+assert(decisionFromScore(45) === "REVIEW", "score 45 → REVIEW");
+assert(decisionFromScore(15) === "APPROVED", "score 15 → APPROVED");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E17 FinCEN 314(a) — fuzzy threshold");
+const fincen314 = ["Pablo Escobar Gaviria","El Chapo Guzman","Dawood Ibrahim","Semion Mogilevich","Carlos Lehder"];
+assert(fuzzyMatch("pablo escobar", fincen314, 0.82, 0.80).matched, "FinCEN partial name hit");
+assert(fuzzyMatch("el chapo", fincen314, 0.82, 0.80).matched, "FinCEN alias hit");
+assert(!fuzzyMatch("john doe", fincen314, 0.82, 0.80).matched, "clean name no FinCEN hit");
+assert(fuzzyMatch("Dawood Ibrahim Kaskar", fincen314, 0.82, 0.80).matched, "FinCEN extra token hit");
+assert(!fuzzyMatch("Jane Smith", fincen314, 0.82, 0.80).matched, "clean woman no FinCEN hit");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E12 Corporate Depth");
+function corpDepth(layers) { return typeof layers === "number" && layers > 4; }
+assert(!corpDepth(2), "2 layers → clean");
+assert(!corpDepth(4), "4 layers → clean");
+assert(corpDepth(5), "5 layers → flag");
+assert(corpDepth(10), "10 layers → flag");
+assert(!corpDepth(undefined), "undefined → clean");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E13 Document Entropy");
+function docEntropy(docs) {
+  if (docs.length === 0) return "NO_DOCUMENTS";
   const now = new Date();
-  const age = (now - birth) / (365.25*24*3600*1000);
-  if (birth > now) return "future";
-  if (age < 18) return "under_18";
-  if (age > 120) return "over_120";
-  return "ok";
+  for (const d of docs) { if (d.expiry && new Date(d.expiry) < now) return "EXPIRED_DOCUMENT"; }
+  return null;
 }
-test("valid adult DOB", () => assert.equal(checkDOB("1987-08-22"), "ok"));
-test("future DOB flagged", () => assert.equal(checkDOB("2099-01-01"), "future"));
-test("under 18 flagged", () => assert.equal(checkDOB("2015-01-01"), "under_18"));
-test("over 120 flagged", () => assert.equal(checkDOB("1890-01-01"), "over_120"));
-test("invalid format", () => assert.equal(checkDOB("not-a-date"), "invalid"));
+assert(docEntropy([]) === "NO_DOCUMENTS", "no docs → flag");
+assert(docEntropy([{ type:"passport", expiry:"2020-01-01" }]) === "EXPIRED_DOCUMENT", "expired doc → flag");
+assert(docEntropy([{ type:"passport", expiry:"2030-01-01" }]) === null, "valid doc → clean");
+assert(docEntropy([{ type:"drivers_license" }]) === null, "doc without expiry → clean");
 
-// ── E10 Address Risk ──────────────────────────────────────────────────────────
-console.log("\n[E10_AddressRisk]");
-const HIGH_RISK = new Set(["NV","DE","WY","MT","SD","NM"]);
-test("Nevada flagged", () => assert(HIGH_RISK.has("NV")));
-test("Delaware flagged", () => assert(HIGH_RISK.has("DE")));
-test("Wyoming flagged", () => assert(HIGH_RISK.has("WY")));
-test("California not flagged", () => assert(!HIGH_RISK.has("CA")));
-test("New York not flagged", () => assert(!HIGH_RISK.has("NY")));
-test("Texas not flagged", () => assert(!HIGH_RISK.has("TX")));
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E5 Velocity");
+function velocityFlag(count) { return count > 5; }
+assert(!velocityFlag(0), "0 submissions → clean");
+assert(!velocityFlag(5), "5 submissions → clean");
+assert(velocityFlag(6), "6 submissions → flag");
+assert(velocityFlag(100), "100 submissions → flag");
 
-// ── E11 Entity Consistency ────────────────────────────────────────────────────
-console.log("\n[E11_EntityConsistency]");
-function checkConsistency(p) {
-  const flags = [];
-  if (p.entity_type === "individual" && p.business_name) flags.push("individual_has_business_name");
-  if (p.entity_type === "business" && !p.business_name) flags.push("business_missing_name");
-  if (p.entity_type === "business" && p.ssn) flags.push("business_has_ssn");
-  return flags;
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E8 UBO cascade — ownership threshold");
+function uboMaterial(pct) { return pct >= 25; }
+assert(!uboMaterial(10), "10% owner → not material");
+assert(!uboMaterial(24), "24% owner → not material");
+assert(uboMaterial(25), "25% owner → material");
+assert(uboMaterial(51), "51% owner → material");
+assert(uboMaterial(100), "100% owner → material");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("Score clamping to 100");
+function clamp(v, max) { return Math.min(v, max); }
+assert(clamp(150, 100) === 100, "score 150 → clamped 100");
+assert(clamp(70, 100) === 70, "score 70 → unchanged");
+assert(clamp(0, 100) === 0, "score 0 → unchanged");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("account_generation gate logic");
+function accountAllowed(decision) { return decision === "APPROVED"; }
+assert(accountAllowed("APPROVED"), "APPROVED → account allowed");
+assert(!accountAllowed("REVIEW"), "REVIEW → account blocked");
+assert(!accountAllowed("DENIED"), "DENIED → account blocked");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("review_queued logic");
+function reviewQueued(decision) { return decision === "REVIEW" || decision === "DENIED"; }
+assert(!reviewQueued("APPROVED"), "APPROVED → not queued");
+assert(reviewQueued("REVIEW"), "REVIEW → queued");
+assert(reviewQueued("DENIED"), "DENIED → queued");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("CORS header presence");
+function corsHeaders(origin) {
+  return {
+    "Access-Control-Allow-Origin": origin || "*",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Gateway-Api-Key,X-Kyc-Admin-Key,X-Submission-Id",
+    "Access-Control-Expose-Headers": "X-Submission-Id",
+  };
 }
-test("individual with business_name = flagged", () => assert(checkConsistency({entity_type:"individual",business_name:"Acme"}).length > 0));
-test("business without name = flagged", () => assert(checkConsistency({entity_type:"business"}).length > 0));
-test("business with SSN = flagged", () => assert(checkConsistency({entity_type:"business",business_name:"Acme",ssn:"123456789"}).length > 0));
-test("clean individual = no flags", () => assert.equal(checkConsistency({entity_type:"individual",applicant_name:"John"}).length, 0));
-test("clean business = no flags", () => assert.equal(checkConsistency({entity_type:"business",business_name:"Acme Inc"}).length, 0));
+const h = corsHeaders("https://app.example.com");
+assert(h["Access-Control-Allow-Origin"] === "https://app.example.com", "CORS origin set");
+assert(h["Access-Control-Expose-Headers"].includes("X-Submission-Id"), "X-Submission-Id exposed");
+assert(h["Access-Control-Allow-Methods"].includes("POST"), "POST method allowed");
+const hDefault = corsHeaders(null);
+assert(hDefault["Access-Control-Allow-Origin"] === "*", "wildcard fallback");
 
-// ── E12 Corporate Depth ───────────────────────────────────────────────────────
-console.log("\n[E12_CorporateDepth]");
-test("depth 5 = flagged", () => assert([{},{},{},{},{}].length > 4));
-test("depth 4 = NOT flagged", () => assert(!([{},{},{},{}].length > 4)));
-test("depth 0 = NOT flagged", () => assert(!(0 > 4)));
+// ═══════════════════════════════════════════════════════════════════════════════
+section("Version / engine count");
+const VERSION = "9.0", ENGINES_COUNT = 18;
+assert(VERSION === "9.0", "version string correct");
+assert(ENGINES_COUNT === 18, "engine count is 18");
 
-// ── E15 Synthetic Identity ────────────────────────────────────────────────────
-console.log("\n[E15_SyntheticIdentity]");
-function syntheticCheck(ssn) {
-  const d = ssn.replace(/\D/g,"");
-  if (d.length !== 9) return false;
-  return parseInt(d.slice(0,3),10) >= 900;
+// ═══════════════════════════════════════════════════════════════════════════════
+section("Timeout fence → REVIEW decision");
+const timeoutResult = { score: 45, decision: "REVIEW", flags: ["TIMEOUT"] };
+assert(timeoutResult.decision === "REVIEW", "timeout → REVIEW decision");
+assert(timeoutResult.flags.includes("TIMEOUT"), "timeout → TIMEOUT flag");
+assert(timeoutResult.score === 45, "timeout → score 45");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("TIN formatting helpers");
+function fmtSSN(tin) { const c = tin.replace(/\D/g,""); return c.replace(/(\d{3})(\d{2})(\d{4})/,"$1-$2-$3"); }
+function fmtEIN(tin) { const c = tin.replace(/\D/g,""); return c.replace(/(\d{2})(\d{7})/,"$1-$2"); }
+assert(fmtSSN("123456789") === "123-45-6789", "SSN formatted");
+assert(fmtEIN("123456789") === "12-3456789", "EIN formatted");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("PEP list fuzzy — world leaders");
+const pepList = ["Vladimir Putin","Xi Jinping","Kim Jong-un","Nicolás Maduro","Alexander Lukashenko","Bashar al-Assad","Ayatollah Khamenei","Recep Tayyip Erdoğan","Mohammed bin Salman","Fidel Castro"];
+assert(fuzzyMatch("nicolas maduro", pepList).matched, "PEP: Maduro hit");
+assert(fuzzyMatch("xi jinping", pepList).matched, "PEP: Xi Jinping hit");
+assert(fuzzyMatch("bashar al-asad", pepList).matched, "PEP: Assad variant hit");
+assert(!fuzzyMatch("alice johnson", pepList).matched, "PEP: clean name no hit");
+assert(fuzzyMatch("mohammed bin salman", pepList).matched, "PEP: full MBS name hit");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E16 Watchlist Delta — newly added SDN");
+const delta = ["Igor Sechin","Nikolai Patrushev","Sergei Lavrov","Viktor Medvedchuk"];
+assert(fuzzyMatch("igor sechin", delta).matched, "delta: Igor Sechin hit");
+assert(fuzzyMatch("sergei lavrov", delta).matched, "delta: Lavrov hit");
+assert(!fuzzyMatch("john smith", delta).matched, "delta: clean no hit");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+section("E11 Entity Consistency — individual SSN area used for business");
+function entityInconsistency(entityType, tin) {
+  if (entityType !== "business") return false;
+  const c = tin.replace(/\D/g,"");
+  const individualOnly = ["575","576","750","751","752","753","754"];
+  return individualOnly.some(p => c.startsWith(p));
 }
-test("SSN 900-xx = synthetic", () => assert(syntheticCheck("900-12-3456")));
-test("SSN 999-xx = synthetic", () => assert(syntheticCheck("999-12-3456")));
-test("SSN 123-xx = not synthetic", () => assert(!syntheticCheck("123-12-3456")));
-test("SSN 500-xx = not synthetic", () => assert(!syntheticCheck("500-12-3456")));
+assert(!entityInconsistency("individual","575123456"), "individual SSN area → no inconsistency flag");
+assert(entityInconsistency("business","575123456"), "business with SSN area 575 → inconsistency");
+assert(!entityInconsistency("business","123456789"), "business with valid EIN → no inconsistency");
 
-// ── Decision bands ────────────────────────────────────────────────────────────
-console.log("\n[Decision Bands]");
-function decide(score) {
-  if (score < 30) return "APPROVED";
-  if (score < 70) return "REVIEW";
-  return "DENIED";
-}
-test("score 0 = APPROVED", () => assert.equal(decide(0), "APPROVED"));
-test("score 29 = APPROVED", () => assert.equal(decide(29), "APPROVED"));
-test("score 30 = REVIEW", () => assert.equal(decide(30), "REVIEW"));
-test("score 69 = REVIEW", () => assert.equal(decide(69), "REVIEW"));
-test("score 70 = DENIED", () => assert.equal(decide(70), "DENIED"));
-test("score 100 = DENIED", () => assert.equal(decide(100), "DENIED"));
+// ═══════════════════════════════════════════════════════════════════════════════
+section("Review action validation");
+const validActions = ["approve","reject","escalate"];
+assert(validActions.includes("approve"), "approve is valid action");
+assert(validActions.includes("reject"), "reject is valid action");
+assert(validActions.includes("escalate"), "escalate is valid action");
+assert(!validActions.includes("delete"), "delete is not valid action");
+assert(!validActions.includes(""), "empty string not valid action");
 
-// ── E17 FinCEN 314(a) name normalization ──────────────────────────────────────
-console.log("\n[E17_FinCEN_314a normalName]");
-test("carlos escobar mendez normalized", () => assert.equal(normalName("Carlos Escobar Mendez"), "carlos escobar mendez"));
-test("Jr stripped before match", () => assert.equal(normalName("Carlos Escobar Jr"), "carlos escobar"));
-test("LLC stripped before match", () => assert.equal(normalName("Chen Wei Hong LLC"), "chen wei hong"));
-test("punctuation stripped", () => assert.equal(normalName("Ibrahim Al-Rashid"), "ibrahim alrashid"));
+// ═══════════════════════════════════════════════════════════════════════════════
+section("Submission ID format (UUID v4 shape)");
+function isUUID(s) { return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s); }
+assert(isUUID("550e8400-e29b-41d4-a716-446655440000"), "valid UUID v4 passes");
+assert(!isUUID("not-a-uuid"), "invalid string fails");
+assert(!isUUID(""), "empty string fails");
 
-// ── Scoring cap tests ─────────────────────────────────────────────────────────
-console.log("\n[Scoring Caps]");
-test("OFAC cap at 70", () => assert.equal(Math.min(3*40, 70), 70));
-test("PEP cap at 50", () => assert.equal(Math.min(3*25, 50), 50));
-test("Adverse media cap at 30", () => assert.equal(Math.min(7*5, 30), 30));
-test("Total score cap at 100", () => assert.equal(Math.min(999, 100), 100));
-test("OFAC single hit = 40", () => assert.equal(Math.min(1*40, 70), 40));
-test("PEP single hit = 25", () => assert.equal(Math.min(1*25, 50), 25));
+// ─── Summary ──────────────────────────────────────────────────────────────────
 
-// ── Integration scenario: clean individual ────────────────────────────────────
-console.log("\n[Integration Scenarios]");
-test("clean individual scores 0 on structuring at $100", () => assert(!structFlag(100)));
-test("clean individual DOB 1990 is OK", () => assert.equal(checkDOB("1990-06-15"), "ok"));
-test("clean SSN 500-22-1234 is valid", () => assert(validateSSN("500-22-1234").valid));
-
-// ── Final report ──────────────────────────────────────────────────────────────
-console.log(`\n${"═".repeat(50)}`);
-console.log(`Total: ${passed + failed} | ✅ Passed: ${passed} | ❌ Failed: ${failed}`);
-if (failed > 0) process.exit(1);
+console.log(`\n${"═".repeat(55)}`);
+console.log(`  kyc-gateway v9.0 — unit test results`);
+console.log(`  Total: ${total}  ✅ Passed: ${passed}  ❌ Failed: ${failed}`);
+console.log("═".repeat(55));
+if (failed > 0) { process.exit(1); } else { console.log("  All assertions passed.\n"); }

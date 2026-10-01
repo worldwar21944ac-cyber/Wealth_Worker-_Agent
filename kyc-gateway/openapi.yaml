@@ -1,776 +1,325 @@
-openapi: "3.1.0"
+openapi: 3.1.0
 info:
-  title: "KYC Gateway v8.1 — Sub-2-Second Intake Screening"
+  title: kyc-gateway
+  version: "9.0"
   description: |
-    Bervashun Trust Capital KYC/KYB screening gateway deployed on Cloudflare Workers.
-
-    ## Screening Engines (17, run in parallel via Promise.all)
-
-    | Engine | Signal | Weight |
-    |--------|--------|--------|
-    | E1  | OFAC SDN (Jaro-Winkler ≥ 0.82) | 40 pts, cap 70 |
-    | E2  | PEP list match | 25 pts, cap 50 |
-    | E3  | FATF High-Risk Jurisdiction (55 countries) | 20 pts |
-    | E4  | TIN/EIN validity (SSN area, IRS disallowed prefixes) | 20 pts |
-    | E5  | Velocity (>5 submissions / TIN / 24 h) | 15 pts |
-    | E6  | Structuring ($8,000–$9,999 range) | 35 pts |
-    | E7  | Adverse media keywords (5 pts each, cap 30) | 30 pts |
-    | E8  | UBO Cascade (≥25% ownership; SDN+PEP parallel) | 25 pts / UBO |
-    | E9  | DOB Plausibility (future, under-18, over-120) | 35 pts |
-    | E10 | Address Risk (high-risk ZIP) | 10 pts |
-    | E11 | Entity Consistency (name/TIN mismatch) | 15 pts |
-    | E12 | Corporate Depth (>4 ownership layers) | 20 pts |
-    | E13 | Document Entropy (expired, low-entropy doc numbers) | 10 pts |
-    | E14 | Network Graph (shared TIN or address, D1 cross-ref) | 20 pts |
-    | E15 | Synthetic Identity (SSN area code 900+) | 40 pts |
-    | E16 | Watchlist Delta (7-day SDN additions) | 30 pts |
-    | E17 | FinCEN 314(a) list match **(NEW v8.1)** | 25 pts |
-
-    ## Decision Bands
-    - **0–29** → `APPROVED` (`account_generation.allowed = true`)
-    - **30–69** → `REVIEW` (queued for human; `account_generation.allowed = false`)
-    - **70–100** → `DENIED` (fires `SYSTEM_ALERT` to notify worker)
-
-    ## Hard Timeout
-    All 17 engines must complete within **1,800 ms**; any breach auto-routes to `REVIEW`.
-
-    ## Authentication
-    - `/api/kyc/apply` and `/api/kyc/status/:id` require `X-Api-Key` header (GATEWAY_AUTH KV lookup)
-    - Admin routes require `X-Admin-Key` header matching the `KYC_ADMIN_KEY` secret
-
-  version: "8.1.0"
-  contact:
-    name: "Bervashun Trust Capital — Platform Engineering"
-    email: "worldwar2.1944.ac@gmail.com"
-  license:
-    name: "Proprietary"
+    Sub-2-second KYC/KYB intake screening with 18 parallel compliance engines.
+    All POST routes require API key authentication.
+    Admin routes additionally require X-Kyc-Admin-Key or Bearer <KYC_ADMIN_KEY>.
 
 servers:
-  - url: "https://kyc.wwwknockoutforever.com"
-    description: "Production (Cloudflare Edge)"
+  - url: https://kyc.wwwknockoutforever.com
+    description: Production (Cloudflare Workers)
 
-tags:
-  - name: "intake"
-    description: "KYC/KYB submission and status"
-  - name: "review"
-    description: "Human review queue and actions"
-  - name: "admin"
-    description: "Admin-only: batch, stats"
-  - name: "system"
-    description: "Health and liveness"
-
-paths:
-  /api/kyc/health:
-    get:
-      summary: "Liveness check"
-      description: "Unauthenticated. Returns engine count, version, and timeout configuration."
-      tags: ["system"]
-      responses:
-        "200":
-          description: "Worker is alive"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/HealthResponse"
-              example:
-                status: "ok"
-                version: "8.1"
-                engines: 17
-                timeout_ms: 1800
-                decision_bands:
-                  APPROVED: "0-29"
-                  REVIEW: "30-69"
-                  DENIED: "70-100"
-                timestamp: "2026-10-01T12:00:00.000Z"
-
-  /api/kyc/apply:
-    post:
-      summary: "Submit KYC (individual) or KYB (business) intake"
-      description: |
-        Primary screening endpoint. Runs all 17 engines in parallel and returns a decision
-        within 1,800 ms. If `account_generation.allowed` is true, downstream account creation
-        may proceed.
-      tags: ["intake"]
-      security:
-        - ApiKeyAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/KycApplyRequest"
-            examples:
-              individual_clean:
-                summary: "Clean individual (expected APPROVED)"
-                value:
-                  entity_type: "individual"
-                  applicant_name: "Alice Johnson"
-                  tin: "234567890"
-                  dob: "1985-05-15"
-                  address:
-                    street: "123 Main St"
-                    city: "New York"
-                    state: "NY"
-                    zip: "10001"
-                    country: "US"
-                  amount: 500
-              business_kyb:
-                summary: "Business KYB with UBO"
-                value:
-                  entity_type: "business"
-                  applicant_name: "Acme Trading LLC"
-                  tin: "201234567"
-                  address:
-                    country: "US"
-                    zip: "10001"
-                  amount: 2500
-                  corporate_depth: 2
-                  beneficial_owners:
-                    - name: "Jane Smith"
-                      ownership_pct: 60
-                  documents:
-                    - document_type: "EIN_LETTER"
-                      document_number: "EIN-2024-00123"
-                      expiry_date: "2030-01-01"
-              high_risk_structuring:
-                summary: "Structuring flag (expected REVIEW)"
-                value:
-                  entity_type: "individual"
-                  applicant_name: "Bob Martinez"
-                  tin: "456789012"
-                  dob: "1975-03-22"
-                  address:
-                    country: "US"
-                    zip: "10001"
-                  amount: 9500
-      responses:
-        "200":
-          description: "Screening complete"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/KycApplyResponse"
-        "400":
-          description: "Missing required fields or malformed JSON"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "401":
-          description: "Invalid or missing API key"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "500":
-          description: "Engine failure"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-
-  /api/kyc/status/{submission_id}:
-    get:
-      summary: "Check submission status"
-      tags: ["intake"]
-      security:
-        - ApiKeyAuth: []
-      parameters:
-        - name: submission_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-          description: "UUID returned by /api/kyc/apply"
-      responses:
-        "200":
-          description: "Submission found"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/KycStatusResponse"
-        "401":
-          description: "Unauthorized"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "404":
-          description: "Submission not found"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-
-  /api/kyc/review:
-    get:
-      summary: "List review queue (paginated)"
-      description: "Returns all REVIEW and DENIED submissions pending human action."
-      tags: ["review"]
-      security:
-        - AdminKeyAuth: []
-      parameters:
-        - name: page
-          in: query
-          schema:
-            type: integer
-            default: 1
-            minimum: 1
-        - name: per_page
-          in: query
-          schema:
-            type: integer
-            default: 25
-            minimum: 1
-            maximum: 100
-        - name: status
-          in: query
-          schema:
-            type: string
-            enum: ["PENDING", "APPROVED", "REJECTED", "ESCALATED"]
-          description: "Filter by review status"
-      responses:
-        "200":
-          description: "Paginated review queue"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ReviewListResponse"
-        "403":
-          description: "Admin key required"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-
-  /api/kyc/review/{submission_id}/approve:
-    post:
-      summary: "Approve a queued submission"
-      tags: ["review"]
-      security:
-        - AdminKeyAuth: []
-      parameters:
-        - name: submission_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ReviewActionRequest"
-      responses:
-        "200":
-          description: "Approved"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ReviewActionResponse"
-        "403":
-          description: "Forbidden"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-
-  /api/kyc/review/{submission_id}/reject:
-    post:
-      summary: "Reject a queued submission"
-      tags: ["review"]
-      security:
-        - AdminKeyAuth: []
-      parameters:
-        - name: submission_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ReviewActionRequest"
-      responses:
-        "200":
-          description: "Rejected"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ReviewActionResponse"
-        "403":
-          description: "Forbidden"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-
-  /api/kyc/review/{submission_id}/escalate:
-    post:
-      summary: "Escalate a queued submission to senior compliance"
-      tags: ["review"]
-      security:
-        - AdminKeyAuth: []
-      parameters:
-        - name: submission_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ReviewActionRequest"
-      responses:
-        "200":
-          description: "Escalated"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ReviewActionResponse"
-        "403":
-          description: "Forbidden"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-
-  /api/kyc/batch:
-    post:
-      summary: "Batch-screen up to 50 entities"
-      description: |
-        Admin-only. Runs all 17 engines on each payload concurrently.
-        Useful for bulk onboarding or retroactive rescreening.
-      tags: ["admin"]
-      security:
-        - AdminKeyAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              oneOf:
-                - type: array
-                  items:
-                    $ref: "#/components/schemas/KycApplyRequest"
-                  maxItems: 50
-                  minItems: 1
-                - type: object
-                  required: ["items"]
-                  properties:
-                    items:
-                      type: array
-                      items:
-                        $ref: "#/components/schemas/KycApplyRequest"
-                      maxItems: 50
-                      minItems: 1
-      responses:
-        "200":
-          description: "Batch results"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/BatchResponse"
-        "400":
-          description: "Empty or oversized batch"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "403":
-          description: "Admin key required"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-
-  /api/kyc/stats:
-    get:
-      summary: "Admin statistics"
-      description: "Aggregate submission counts, avg latency, engine status."
-      tags: ["admin"]
-      security:
-        - AdminKeyAuth: []
-      responses:
-        "200":
-          description: "Stats"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/StatsResponse"
-        "403":
-          description: "Admin key required"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+security:
+  - BearerAuth: []
+  - GatewayApiKey: []
 
 components:
   securitySchemes:
-    ApiKeyAuth:
+    BearerAuth:
+      type: http
+      scheme: bearer
+    GatewayApiKey:
       type: apiKey
       in: header
-      name: X-Api-Key
-      description: "GATEWAY_AUTH KV key; also accepted as `Authorization: Bearer <key>`"
-    AdminKeyAuth:
+      name: X-Gateway-Api-Key
+    AdminKey:
       type: apiKey
       in: header
-      name: X-Admin-Key
-      description: "KYC_ADMIN_KEY secret; also accepted as `Authorization: Bearer <key>`"
+      name: X-Kyc-Admin-Key
 
   schemas:
     Address:
       type: object
       properties:
-        street:
-          type: string
-        city:
-          type: string
-        state:
-          type: string
-        zip:
-          type: string
-          description: "5-digit ZIP used for E10 Address Risk engine"
-        country:
-          type: string
-          description: "ISO 3166-1 alpha-2 code used for E3 FATF engine"
+        street:    { type: string }
+        city:      { type: string }
+        state:     { type: string }
+        zip:       { type: string }
+        country:   { type: string }
 
     BeneficialOwner:
       type: object
-      required: ["name", "ownership_pct"]
+      required: [name, ownership_pct]
       properties:
-        name:
-          type: string
-        ownership_pct:
-          type: number
-          minimum: 0
-          maximum: 100
-          description: "Owners ≥25% are screened via E8 UBO Cascade"
+        name:          { type: string }
+        tin:           { type: string }
+        ownership_pct: { type: number, minimum: 0, maximum: 100 }
+        nationality:   { type: string }
 
     Document:
       type: object
       properties:
-        document_type:
-          type: string
-          example: "PASSPORT"
-        document_number:
-          type: string
-          description: "Numbers <4 chars trigger E13 low-entropy flag"
-        expiry_date:
-          type: string
-          format: date
-          description: "Past dates trigger E13 expired-doc flag"
+        type:    { type: string, enum: [passport, drivers_license, national_id, ein_letter] }
+        number:  { type: string }
+        expiry:  { type: string, format: date }
+        country: { type: string }
 
     KycApplyRequest:
       type: object
-      required: ["applicant_name", "tin"]
+      required: [applicant_name, tin]
       properties:
         entity_type:
           type: string
-          enum: ["individual", "business"]
-          default: "individual"
-        applicant_name:
-          type: string
-          description: "Full legal name (normalized before screening: suffixes Jr/Sr/II/III/IV/LLC/Inc/Corp/Ltd stripped)"
-        tin:
-          type: string
-          description: "SSN (individual) or EIN (business), digits only or formatted"
-        dob:
-          type: string
-          format: date
-          description: "Date of birth (ISO 8601). Required for E9 DOB engine."
-        address:
-          $ref: "#/components/schemas/Address"
-        amount:
-          type: number
-          description: "Transaction amount in USD. Values $8,000–$9,999 trigger E6 Structuring."
-        adverse_media_text:
-          type: string
-          description: "Free-text adverse media / news. Scanned for 18 risk keywords by E7."
+          enum: [individual, business]
+          default: individual
+        applicant_name:        { type: string }
+        tin:                   { type: string, description: "SSN (individual) or EIN (business)" }
+        date_of_birth:         { type: string, format: date }
+        country_code:          { type: string, description: "ISO 3166-1 alpha-2" }
+        previous_country_code: { type: string }
+        address:               { $ref: "#/components/schemas/Address" }
+        transaction_amount:    { type: number, description: "Trigger amount for structuring check" }
+        adverse_media_text:    { type: string, description: "Free-text media summary for keyword scan" }
         beneficial_owners:
           type: array
-          items:
-            $ref: "#/components/schemas/BeneficialOwner"
-          description: "Required for KYB. Owners ≥25% screened via E8 UBO Cascade."
-        corporate_depth:
-          type: integer
-          minimum: 0
-          description: "Number of ownership layers. >4 triggers E12."
+          items: { $ref: "#/components/schemas/BeneficialOwner" }
         documents:
           type: array
-          items:
-            $ref: "#/components/schemas/Document"
-          description: "Supporting ID / legal documents. Scanned by E13 Document Entropy."
+          items: { $ref: "#/components/schemas/Document" }
+        ownership_layers:      { type: integer, description: "Corporate depth layers" }
+        ip_country:            { type: string, description: "Country of current request IP (ISO-2)" }
+        previous_ip_country:   { type: string }
+        previous_ip_timestamp: { type: string, format: date-time }
         network_peers:
           type: array
           items:
-            type: string
-          description: "Known associated TINs / addresses (reserved, passed to E14)."
+            type: object
+            properties:
+              tin:     { type: string }
+              address: { type: string }
 
     EngineBreakdown:
       type: object
-      description: "Per-engine result. Each key is an engine ID (E1_OFAC_SDN … E17_FinCEN)."
       additionalProperties:
         type: object
         properties:
-          pts:
-            type: integer
-          hit:
-            type: boolean
+          score: { type: integer }
+          hits:  { type: array, items: { type: string } }
+
+    AccountGeneration:
+      type: object
+      properties:
+        allowed:        { type: boolean }
+        blocked_reason: { type: string, nullable: true }
 
     KycApplyResponse:
       type: object
       properties:
-        submission_id:
-          type: string
-          format: uuid
-        status:
-          type: string
-          enum: ["APPROVED", "REVIEW", "DENIED"]
-        risk_score:
-          type: integer
-          minimum: 0
-          maximum: 100
-        risk_breakdown:
-          $ref: "#/components/schemas/EngineBreakdown"
-        flags:
-          type: array
-          items:
-            type: string
-          description: "List of engine IDs that scored >0"
-        account_generation:
+        submission_id:    { type: string, format: uuid }
+        version:          { type: string }
+        decision:         { type: string, enum: [APPROVED, REVIEW, DENIED] }
+        risk_score:       { type: integer, minimum: 0, maximum: 100 }
+        flags:            { type: array, items: { type: string } }
+        engines:          { type: object, properties: { count: { type: integer } } }
+        latency_ms:       { type: integer }
+        account_generation: { $ref: "#/components/schemas/AccountGeneration" }
+        review_queued:    { type: boolean }
+        breakdown:        { $ref: "#/components/schemas/EngineBreakdown" }
+        e4_detail:
           type: object
           properties:
-            allowed:
-              type: boolean
-              description: "true only when status=APPROVED"
-            reason:
-              type: string
-        screening:
+            tin_valid: { type: boolean }
+            ein_valid: { type: boolean }
+        e8_detail:
           type: object
           properties:
-            latency_ms:
-              type: integer
-            timed_out:
-              type: boolean
-            engine_version:
-              type: string
-              example: "v8.1"
-            engines_run:
-              type: integer
-              example: 17
-        engines:
+            flagged_owners: { type: array, items: { type: object } }
+        e17_detail:
           type: object
           properties:
-            count:
-              type: integer
-              example: 17
-            version:
-              type: string
-              example: "v8.1"
-            parallel:
-              type: boolean
-              example: true
-            timeout_ms:
-              type: integer
-              example: 1800
-        sanctions:
-          type: object
-          properties:
-            ofac_hits:
-              type: integer
-            pep_hits:
-              type: integer
-            total_sanctions_hits:
-              type: integer
-        tin_validation:
-          type: object
-          properties:
-            valid:
-              type: boolean
-            ein_valid:
-              type: boolean
-        compliance_flags:
-          type: object
-          properties:
-            velocity_flagged:
-              type: boolean
-            structuring_flagged:
-              type: boolean
-            adverse_media_hits:
-              type: integer
+            fincen_hits: { type: array, items: { type: string } }
+        screened_at: { type: string, format: date-time }
 
-    KycStatusResponse:
+    ReviewQueueItem:
       type: object
       properties:
-        submission_id:
-          type: string
-          format: uuid
-        status:
-          type: string
-          enum: ["APPROVED", "REVIEW", "DENIED", "REJECTED", "ESCALATED"]
-        risk_score:
-          type: integer
-        risk_decision:
-          type: string
-        account_generation:
-          type: object
-          properties:
-            allowed:
-              type: boolean
-        screened_at:
-          type: string
-          format: date-time
-        engine_version:
-          type: string
-        flags:
-          type: array
-          items:
-            type: string
-
-    ReviewListResponse:
-      type: object
-      properties:
-        page:
-          type: integer
-        per_page:
-          type: integer
-        total:
-          type: integer
-        items:
-          type: array
-          items:
-            type: object
-            properties:
-              reference_id:
-                type: string
-                format: uuid
-              type:
-                type: string
-                enum: ["REVIEW", "DENIED"]
-              flags:
-                type: array
-                items:
-                  type: string
-              status:
-                type: string
-              created_at:
-                type: string
-                format: date-time
-
-    ReviewActionRequest:
-      type: object
-      properties:
-        reviewer:
-          type: string
-          description: "Name or ID of the reviewer"
-        note:
-          type: string
-          description: "Optional compliance note"
-
-    ReviewActionResponse:
-      type: object
-      properties:
-        submission_id:
-          type: string
-          format: uuid
-        status:
-          type: string
-          enum: ["APPROVED", "REJECTED", "ESCALATED"]
-        actioned_at:
-          type: string
-          format: date-time
-
-    BatchResponse:
-      type: object
-      properties:
-        processed:
-          type: integer
-        results:
-          type: array
-          items:
-            type: object
-            properties:
-              submission_id:
-                type: string
-                format: uuid
-              applicant_name:
-                type: string
-              status:
-                type: string
-                enum: ["APPROVED", "REVIEW", "DENIED"]
-              risk_score:
-                type: integer
+        id:           { type: integer }
+        reference_id: { type: string, format: uuid }
+        type:         { type: string }
+        flags_json:   { type: string }
+        payload_json: { type: string }
+        status:       { type: string, enum: [pending, approved, rejected, escalated] }
+        created_at:   { type: string, format: date-time }
+        resolved_at:  { type: string, format: date-time, nullable: true }
+        resolved_by:  { type: string, nullable: true }
 
     StatsResponse:
       type: object
       properties:
-        engine_version:
-          type: string
-          example: "v8.1"
-        totals:
-          type: object
-          properties:
-            submissions:
-              type: integer
-            approved:
-              type: integer
-            review:
-              type: integer
-            denied:
-              type: integer
-            fincen_hits:
-              type: integer
-              description: "Submissions where E17 FinCEN 314(a) triggered"
-        performance:
-          type: object
-          properties:
-            avg_screen_latency_ms:
-              type: integer
-            target_ms:
-              type: integer
-              example: 1800
-        engines_active:
-          type: integer
-          example: 17
+        version:        { type: string }
+        engines:        { type: integer }
+        total:          { type: integer }
+        approved:       { type: integer }
+        review:         { type: integer }
+        denied:         { type: integer }
+        avg_latency_ms: { type: integer }
+        fincen_hits:    { type: integer }
+        generated_at:   { type: string, format: date-time }
 
-    HealthResponse:
-      type: object
-      properties:
-        status:
-          type: string
-          example: "ok"
-        version:
-          type: string
-          example: "8.1"
-        engines:
-          type: integer
-          example: 17
-        timeout_ms:
-          type: integer
-          example: 1800
-        decision_bands:
-          type: object
-          properties:
-            APPROVED:
-              type: string
-            REVIEW:
-              type: string
-            DENIED:
-              type: string
-        timestamp:
-          type: string
-          format: date-time
+paths:
+  /api/kyc/apply:
+    post:
+      summary: Submit KYC/KYB intake for screening
+      operationId: kycApply
+      security:
+        - BearerAuth: []
+        - GatewayApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/KycApplyRequest" }
+            examples:
+              individual:
+                summary: Individual KYC
+                value:
+                  entity_type: individual
+                  applicant_name: "John Smith"
+                  tin: "123-45-6789"
+                  date_of_birth: "1985-03-22"
+                  country_code: "US"
+                  address: { street: "100 Main St", city: "Austin", state: "TX", zip: "78701" }
+              business:
+                summary: Business KYB
+                value:
+                  entity_type: business
+                  applicant_name: "Acme Holdings LLC"
+                  tin: "12-3456789"
+                  country_code: "US"
+                  beneficial_owners:
+                    - { name: "Jane Doe", tin: "987-65-4321", ownership_pct: 51 }
+                  ownership_layers: 2
+      responses:
+        "200":
+          description: Screening complete
+          headers:
+            X-Submission-Id:
+              schema: { type: string, format: uuid }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/KycApplyResponse" }
+        "401": { description: Unauthorized }
+        "422": { description: Missing required fields }
 
-    ErrorResponse:
-      type: object
-      properties:
-        error:
-          type: string
-        detail:
-          type: string
+  /api/kyc/status/{submission_id}:
+    get:
+      summary: Retrieve submission status
+      operationId: kycStatus
+      parameters:
+        - name: submission_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { description: Submission record }
+        "404": { description: Not found }
+
+  /api/kyc/review:
+    get:
+      summary: List review queue (admin)
+      operationId: kycReviewList
+      security:
+        - AdminKey: []
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: per_page
+          in: query
+          schema: { type: integer, default: 25, maximum: 100 }
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending, approved, rejected, escalated], default: pending }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  page:     { type: integer }
+                  per_page: { type: integer }
+                  total:    { type: integer }
+                  results:
+                    type: array
+                    items: { $ref: "#/components/schemas/ReviewQueueItem" }
+
+  /api/kyc/review/{submission_id}/{action}:
+    post:
+      summary: Take action on a queued submission (admin)
+      operationId: kycReviewAction
+      security:
+        - AdminKey: []
+      parameters:
+        - name: submission_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: action
+          in: path
+          required: true
+          schema: { type: string, enum: [approve, reject, escalate] }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                notes: { type: string }
+      responses:
+        "200": { description: Action applied }
+        "400": { description: Invalid action }
+        "403": { description: Forbidden }
+
+  /api/kyc/batch:
+    post:
+      summary: Batch screening — up to 50 submissions (admin)
+      operationId: kycBatch
+      security:
+        - AdminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [submissions]
+              properties:
+                submissions:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  items: { $ref: "#/components/schemas/KycApplyRequest" }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:   { type: integer }
+                  results: { type: array }
+        "422": { description: 1–50 submissions required }
+
+  /api/kyc/stats:
+    get:
+      summary: Aggregate stats (admin)
+      operationId: kycStats
+      security:
+        - AdminKey: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatsResponse" }
+
+  /api/kyc/health:
+    get:
+      summary: Liveness probe (unauthenticated)
+      operationId: kycHealth
+      security: []
+      responses:
+        "200": { description: Healthy }
+        "503": { description: Degraded (D1 unavailable) }

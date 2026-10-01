@@ -1,158 +1,119 @@
 #!/usr/bin/env bash
-# kyc-gateway v8.1 — Live Integration Tests
-# Usage: KYC_ADMIN_KEY=<key> GATEWAY_API_KEY=<key> bash test.sh
+# kyc-gateway v9.0 — live endpoint smoke tests
+# Usage: KYC_ADMIN_KEY=<key> bash test.sh [base_url]
 set -euo pipefail
 
-BASE="${KYC_BASE_URL:-https://kyc.wwwknockoutforever.com}"
+BASE="${1:-https://kyc.wwwknockoutforever.com}"
 ADMIN_KEY="${KYC_ADMIN_KEY:-kyc-admin-bervashun-2026-secure}"
-API_KEY="${GATEWAY_API_KEY:-78d62c3d8bc33309df5c152ab54b8888e190384346299bdca6dd901fdbba4daa}"
+GATEWAY_KEY="${GATEWAY_API_KEY:-78d62c3d8bc33309df5c152ab54b8888e190384346299bdca6dd901fdbba4daa}"
 
-PASS=0; FAIL=0
+echo "🔍  Smoke testing kyc-gateway v9.0 at $BASE"
+echo ""
+
+pass=0; fail=0
 
 check() {
   local label="$1"; local expected="$2"; local actual="$3"
-  if echo "$actual" | grep -q "$expected" 2>/dev/null; then
-    echo "✅ $label"
-    ((PASS++)) || true
+  if echo "$actual" | grep -q "$expected"; then
+    echo "  ✅  $label"; ((pass++))
   else
-    echo "❌ $label — expected '$expected' in: $actual"
-    ((FAIL++)) || true
+    echo "  ❌  $label (expected '$expected' in: $actual)"; ((fail++))
   fi
 }
 
-echo "═══════════════════════════════════════════════"
-echo "  kyc-gateway v8.1 — Live Integration Tests"
-echo "  Base: $BASE"
-echo "═══════════════════════════════════════════════"
-echo ""
+# ── Health ────────────────────────────────────────────────────────────────────
+HEALTH=$(curl -sf "$BASE/api/kyc/health" || echo '{"status":"error"}')
+check "Health endpoint returns ok"      '"ok"'         "$HEALTH"
+check "Health reports version 9.0"     '"9.0"'        "$HEALTH"
+check "Health reports 18 engines"      '"engines":18' "$HEALTH"
 
-# ── Health
-echo "── Health"
-H=$(curl -sf "$BASE/api/kyc/health")
-check "Health status=ok"        '"status":"ok"'    "$H"
-check "Health version=8.1"      '"version":"8.1"'  "$H"
-check "Health engines=17"       '"engines":17'     "$H"
-echo ""
-
-# ── Unauthorized
-echo "── Auth"
-R=$(curl -sf -o /dev/null -w "%{http_code}" -X POST "$BASE/api/kyc/apply" \
+# ── APPROVED individual ───────────────────────────────────────────────────────
+APPROVED=$(curl -sf -X POST "$BASE/api/kyc/apply" \
+  -H "Authorization: Bearer $GATEWAY_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"applicant_name":"Test","tin":"123456789"}' 2>/dev/null || echo "401")
-check "No API key → 401"   "401"   "$R"
-echo ""
-
-# ── Clean individual (APPROVED)
-echo "── Clean Individual"
-R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
-  -H "Content-Type: application/json" \
-  -H "X-Api-Key: $API_KEY" \
   -d '{
     "entity_type":"individual",
-    "applicant_name":"Alice Johnson",
-    "tin":"234567890",
-    "dob":"1985-05-15",
-    "address":{"country":"US","zip":"10001"},
-    "amount":500
-  }')
-check "Clean individual → APPROVED"   '"status":"APPROVED"'         "$R"
-check "account_generation.allowed"    '"allowed":true'              "$R"
-check "17 engines run"                '"engines_run":17'            "$R"
-check "engine version v8.1"           '"engine_version":"v8.1"'     "$R"
-SID=$(echo "$R" | python3 -c "import json,sys; print(json.load(sys.stdin)['submission_id'])" 2>/dev/null || echo "unknown")
-echo "   submission_id: $SID"
-echo ""
+    "applicant_name":"Alice Whitmore",
+    "tin":"234-56-7890",
+    "date_of_birth":"1985-04-12",
+    "country_code":"US",
+    "address":{"street":"200 Oak Ave","city":"Chicago","state":"IL","zip":"60601"},
+    "documents":[{"type":"passport","expiry":"2030-06-01"}]
+  }' || echo '{"decision":"ERROR"}')
+check "APPROVED clean individual"       '"APPROVED"'       "$APPROVED"
+check "Account generation allowed"      '"allowed":true'   "$APPROVED"
+check "18 engines reported"             '"count":18'       "$APPROVED"
+check "latency_ms present"             '"latency_ms"'     "$APPROVED"
 
-# ── Status check
-echo "── Status"
-if [[ "$SID" != "unknown" ]]; then
-  S=$(curl -sf "$BASE/api/kyc/status/$SID" -H "X-Api-Key: $API_KEY")
-  check "Status found"             '"submission_id"'    "$S"
-  check "Status = APPROVED"        '"status":"APPROVED"' "$S"
-fi
-echo ""
-
-# ── Structuring flag (REVIEW)
-echo "── Structuring (E6)"
-R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
+# ── DENIED — OFAC hit ────────────────────────────────────────────────────────
+DENIED=$(curl -sf -X POST "$BASE/api/kyc/apply" \
+  -H "Authorization: Bearer $GATEWAY_KEY" \
   -H "Content-Type: application/json" \
-  -H "X-Api-Key: $API_KEY" \
   -d '{
     "entity_type":"individual",
-    "applicant_name":"Bob Martinez",
-    "tin":"456789012",
-    "dob":"1975-03-22",
-    "address":{"country":"US","zip":"10001"},
-    "amount":9500
-  }')
-check "Structuring → REVIEW"          '"status":"REVIEW"'   "$R"
-check "E6_Structuring flagged"        'E6_Structuring'      "$R"
-check "structuring_flagged=true"      '"structuring_flagged":true' "$R"
-echo ""
+    "applicant_name":"Qasem Soleimani",
+    "tin":"900-00-1234",
+    "country_code":"IR",
+    "date_of_birth":"1957-03-11"
+  }' || echo '{"decision":"ERROR"}')
+check "DENIED OFAC hit"                '"DENIED"'              "$DENIED"
+check "OFAC_SDN_HIT flag present"     '"OFAC_SDN_HIT"'       "$DENIED"
+check "Account generation blocked"    '"allowed":false'       "$DENIED"
+check "review_queued true"            '"review_queued":true'  "$DENIED"
 
-# ── Synthetic SSN (E15)
-echo "── Synthetic Identity (E15)"
-R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
+# ── REVIEW — structuring ─────────────────────────────────────────────────────
+REVIEW=$(curl -sf -X POST "$BASE/api/kyc/apply" \
+  -H "Authorization: Bearer $GATEWAY_KEY" \
   -H "Content-Type: application/json" \
-  -H "X-Api-Key: $API_KEY" \
   -d '{
     "entity_type":"individual",
-    "applicant_name":"Carl Davis",
-    "tin":"900000001",
-    "dob":"1990-01-01",
-    "address":{"country":"US","zip":"10001"},
-    "amount":100
-  }')
-check "Synthetic SSN → REVIEW or DENIED" '"status":"' "$R"
-check "E15_Synthetic_ID in flags"         'E15_Synthetic' "$R"
-echo ""
+    "applicant_name":"Bob Neutral",
+    "tin":"345-67-8901",
+    "date_of_birth":"1975-08-20",
+    "country_code":"US",
+    "transaction_amount":8500
+  }' || echo '{"decision":"ERROR"}')
+check "REVIEW structuring detected"      '"REVIEW"'                "$REVIEW"
+check "STRUCTURING_DETECTED flag"       '"STRUCTURING_DETECTED"'  "$REVIEW"
 
-# ── FATF country (E3)
-echo "── FATF High-Risk Country (E3)"
-R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
+# ── Unauthorized (no key) ─────────────────────────────────────────────────────
+UNAUTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/kyc/apply" \
   -H "Content-Type: application/json" \
-  -H "X-Api-Key: $API_KEY" \
-  -d '{
-    "entity_type":"individual",
-    "applicant_name":"Dana Lee",
-    "tin":"345678901",
-    "dob":"1980-06-15",
-    "address":{"country":"IR","zip":"10001"},
-    "amount":100
-  }')
-check "FATF Iran → REVIEW or DENIED"  '"status":"'     "$R"
-check "E3_FATF flagged"               'E3_FATF'        "$R"
-echo ""
+  -d '{"applicant_name":"x","tin":"123-45-6789"}')
+check "No auth → 401"                   "401"  "$UNAUTH_STATUS"
 
-# ── Admin stats
-echo "── Stats (admin)"
-R=$(curl -sf "$BASE/api/kyc/stats" -H "X-Admin-Key: $ADMIN_KEY")
-check "Stats has totals"          '"totals"'          "$R"
-check "Stats has engine_version"  '"engine_version"'  "$R"
-check "Stats has fincen_hits"     '"fincen_hits"'     "$R"
-echo ""
-
-# ── Review queue
-echo "── Review Queue"
-R=$(curl -sf "$BASE/api/kyc/review" -H "X-Admin-Key: $ADMIN_KEY")
-check "Review queue returns page"    '"page"'     "$R"
-check "Review queue returns items"   '"items"'    "$R"
-echo ""
-
-# ── Batch
-echo "── Batch (admin)"
-R=$(curl -sf -X POST "$BASE/api/kyc/batch" \
+# ── Missing required fields → 422 ────────────────────────────────────────────
+MISSING_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/kyc/apply" \
+  -H "Authorization: Bearer $GATEWAY_KEY" \
   -H "Content-Type: application/json" \
-  -H "X-Admin-Key: $ADMIN_KEY" \
-  -d '[
-    {"entity_type":"individual","applicant_name":"Eve Turner","tin":"567890123","dob":"1992-04-10","address":{"country":"US","zip":"10001"},"amount":200},
-    {"entity_type":"business","applicant_name":"Frontier Corp","tin":"201234567","address":{"country":"US","zip":"10001"},"amount":5000}
-  ]')
-check "Batch processed=2"      '"processed":2'   "$R"
-check "Batch has results"      '"results"'       "$R"
-echo ""
+  -d '{"entity_type":"individual"}')
+check "Missing fields → 422"            "422"  "$MISSING_STATUS"
 
-echo "═══════════════════════════════════════════════"
-echo "  Results: ✅ $PASS passed  |  ❌ $FAIL failed"
-echo "═══════════════════════════════════════════════"
-[[ $FAIL -eq 0 ]] && exit 0 || exit 1
+# ── Admin stats ───────────────────────────────────────────────────────────────
+STATS=$(curl -sf "$BASE/api/kyc/stats" \
+  -H "X-Kyc-Admin-Key: $ADMIN_KEY" || echo '{"error":"fail"}')
+check "Stats returns total field"       '"total"'     "$STATS"
+check "Stats returns version 9.0"      '"9.0"'       "$STATS"
+check "Stats returns engine count"     '"engines"'   "$STATS"
+check "Stats returns fincen_hits"      '"fincen_hits"' "$STATS"
+
+# ── Review queue (admin) ───────────────────────────────────────────────────────
+QUEUE=$(curl -sf "$BASE/api/kyc/review" \
+  -H "X-Kyc-Admin-Key: $ADMIN_KEY" || echo '{"error":"fail"}')
+check "Review queue returns results"   '"results"' "$QUEUE"
+check "Review queue has total field"   '"total"'   "$QUEUE"
+
+# ── 404 for unknown path ──────────────────────────────────────────────────────
+NOT_FOUND=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/not-a-real-path")
+check "Unknown path → 404"             "404" "$NOT_FOUND"
+
+# ── CORS headers ─────────────────────────────────────────────────────────────
+CORS_HEADERS=$(curl -sf -I -X OPTIONS "$BASE/api/kyc/health" \
+  -H "Origin: https://app.bervashun.com" || echo "")
+check "CORS allow-origin header present" "Access-Control-Allow-Origin" "$CORS_HEADERS"
+
+echo ""
+echo "═══════════════════════════════════════════════════"
+echo "  Smoke test results: ✅ $pass passed  ❌ $fail failed"
+echo "═══════════════════════════════════════════════════"
+[[ $fail -eq 0 ]]

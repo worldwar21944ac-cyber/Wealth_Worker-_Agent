@@ -16,5 +16,9 @@ id = "203d064ff04b45d9b15a363aa18427be"
 binding = "GATEWAY_AUTH"
 id = "06af84f811b84abbb1d956b639d0cd07"
 
-[vars]
-ENVIRONMENT = "production"
+# Secrets (set via wrangler secret put or Cloudflare API):
+# KYC_ADMIN_KEY
+# NOTIFIER_TOKEN
+
+[routes]
+# Custom domain handled via CF dashboard / API
