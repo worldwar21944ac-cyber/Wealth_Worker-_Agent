@@ -1,0 +1,27 @@
+name = "ai-search"
+main = "worker.js"
+compatibility_date = "2026-09-02"
+compatibility_flags = ["nodejs_compat"]
+
+account_id = "fd6f05d3bbca4cc5f175ca4f7154552b"
+
+[limits]
+cpu_ms = 30000
+
+# ─── Workers AI ────────────────────────────────────────────────────────────────
+[ai]
+binding = "AI"
+
+# ─── Vectorize index ───────────────────────────────────────────────────────────
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "ai-search-index"
+
+# ─── D1 database (reuse existing bervashun-audit) ─────────────────────────────
+[[d1_databases]]
+binding = "SEARCH_DB"
+database_name = "bervashun-audit"
+database_id = "f2fe6105-b552-42b4-a2ca-9d2a349861da"
+
+# ─── Secrets (set via wrangler secret put) ─────────────────────────────────────
+# SEARCH_ADMIN_KEY   — admin auth for /index, /documents routes
