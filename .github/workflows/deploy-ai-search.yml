@@ -1,0 +1,85 @@
+name: Deploy ai-search Worker
+
+on:
+  push:
+    branches: [main, ai-search-v1]
+    paths:
+      - "ai-search/**"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to Cloudflare Workers
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ai-search
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Wrangler
+        run: npm install -g wrangler@latest
+
+      - name: Create Vectorize index (idempotent)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          wrangler vectorize create ai-search-index \
+            --dimensions=768 \
+            --metric=cosine \
+            --account-id=fd6f05d3bbca4cc5f175ca4f7154552b || true
+
+      - name: Create D1 table (idempotent)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          wrangler d1 execute bervashun-audit \
+            --account-id=fd6f05d3bbca4cc5f175ca4f7154552b \
+            --command="CREATE TABLE IF NOT EXISTS search_documents (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              content TEXT NOT NULL,
+              source TEXT,
+              category TEXT,
+              metadata TEXT,
+              indexed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );" || true
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          workingDirectory: ai-search
+
+      - name: Set SEARCH_ADMIN_KEY secret
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          echo "${{ secrets.SEARCH_ADMIN_KEY }}" | \
+            wrangler secret put SEARCH_ADMIN_KEY \
+            --name ai-search \
+            --account-id fd6f05d3bbca4cc5f175ca4f7154552b
+
+      - name: Bind custom domain
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: |
+          curl -s -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/fd6f05d3bbca4cc5f175ca4f7154552b/workers/scripts/ai-search/domains" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"hostname":"ai-search.wwwknockoutforever.com","zone_id":"525461af7dfa6b8bbe5f8f7d465602a0","service":"ai-search","environment":"production"}' || true
+
+      - name: Smoke test
+        run: |
+          sleep 5
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://ai-search.wwwknockoutforever.workers.dev/health)
+          echo "Health check status: $STATUS"
+          [ "$STATUS" = "200" ] && echo "✅ Worker healthy" || echo "⚠ Check worker logs"
