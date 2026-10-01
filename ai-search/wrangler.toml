@@ -1,27 +1,25 @@
 name            = "ai-search"
 main            = "worker.js"
 compatibility_date = "2026-09-02"
-account_id      = "fd6f05d3bbca4cc5f175ca4f7154552b"
+compatibility_flags = ["nodejs_compat"]
 
-[limits]
-cpu_ms = 30000
+account_id = "fd6f05d3bbca4cc5f175ca4f7154552b"
 
-# ── Workers AI ──────────────────────────────────────────────────────────────────
 [ai]
 binding = "AI"
 
-# ── Vectorize ───────────────────────────────────────────────────────────────────
 [[vectorize]]
-binding        = "VECTORIZE"
-index_name     = "ai-search-index"
+binding = "VECTORIZE"
+index_name = "ai-search-index"
 
-# ── D1 ──────────────────────────────────────────────────────────────────────────
 [[d1_databases]]
-binding      = "SEARCH_DB"
+binding   = "SEARCH_DB"
 database_name = "bervashun-audit"
-database_id  = "f2fe6105-b552-42b4-a2ca-9d2a349861da"
+database_id   = "f2fe6105-b552-42b4-a2ca-9d2a349861da"
 
-# ── Routes ──────────────────────────────────────────────────────────────────────
-[[routes]]
-pattern = "ai-search.wwwknockoutforever.com/*"
-zone_name = "wwwknockoutforever.com"
+[vars]
+# Non-secret vars (override with secrets in production)
+SERVICE_NAME = "ai-search"
+VERSION      = "2.0"
+
+# Secret: SEARCH_ADMIN_KEY — set via: wrangler secret put SEARCH_ADMIN_KEY

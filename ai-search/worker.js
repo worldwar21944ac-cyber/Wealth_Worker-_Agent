@@ -1,457 +1,509 @@
 /**
- * ai-search — Cloudflare Worker v1.0
- * Semantic search + RAG using Workers AI (BGE-base embeddings) + Vectorize + D1
+ * AI Search Worker v2.0 — Bervashun / Knockoutforever
+ * Cloudflare Worker with Vectorize + Workers AI + D1
  *
  * Routes:
- *   POST /index              — ingest 1-50 docs  (admin: X-Search-Admin-Key header)
- *   DELETE /index/:id        — remove one doc     (admin)
- *   POST /search             — semantic search    { query, top_k?, threshold?, category? }
- *   GET  /search?q=          — browser-friendly   ?q=...&top_k=5&category=...
- *   POST /ai/ask             — RAG answer          { question, top_k?, category? }
- *   GET  /documents          — list indexed docs  (admin)
- *   DELETE /documents        — purge all docs     (admin)
- *   GET  /health             — liveness (no auth)
+ *   POST /index               — ingest 1-50 docs (admin X-Search-Admin-Key)
+ *   DELETE /index/:id         — remove document (admin)
+ *   POST /search              — semantic search { query, top_k?, threshold?, category? }
+ *   GET  /search?q=           — browser-friendly semantic search
+ *   POST /ai/ask              — RAG answer { question, top_k?, category? }
+ *   GET  /ai/ask?q=           — browser-friendly RAG
+ *   GET  /documents           — list indexed docs (admin)
+ *   DELETE /documents         — purge all (admin)
+ *   GET  /health              — liveness (unauthenticated)
  *
- * Bindings (wrangler.toml):
- *   AI          — Workers AI binding
- *   VECTORIZE   — Vectorize index  (ai-search-index, 768-dim, cosine)
- *   SEARCH_DB   — D1 database      (bervashun-audit, id: f2fe6105-b552-42b4-a2ca-9d2a349861da)
- *
- * Secrets:
- *   SEARCH_ADMIN_KEY  — admin key for write/delete endpoints
- *
- * Embedding model:  @cf/baai/bge-base-en-v1.5  (768 dim)
- * LLM (RAG):        @cf/meta/llama-3.1-8b-instruct
+ * Bindings:
+ *   AI           — Workers AI binding
+ *   VECTORIZE    — Vectorize index (ai-search-index, 768-dim cosine)
+ *   SEARCH_DB    — D1 database (bervashun-audit)
+ *   SEARCH_ADMIN_KEY — secret
  */
 
 const EMBED_MODEL = '@cf/baai/bge-base-en-v1.5';
 const LLM_MODEL   = '@cf/meta/llama-3.1-8b-instruct';
-const MAX_BATCH   = 50;
-const DEFAULT_TOP_K = 5;
-const DEFAULT_THRESHOLD = 0.4;
+const EMBED_DIMS  = 768;
 
-// ─── CORS helpers ─────────────────────────────────────────────────────────────
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin':  '*',
-  'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Search-Admin-Key',
+// ─────────────────────────────────────────────
+// CORS helpers
+// ─────────────────────────────────────────────
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type,X-Search-Admin-Key,Authorization',
 };
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+    headers: { 'Content-Type': 'application/json', ...CORS },
   });
 }
 
 function err(msg, status = 400) {
-  return json({ success: false, error: msg }, status);
+  return json({ error: msg, ok: false }, status);
 }
 
-// ─── D1 schema bootstrap ──────────────────────────────────────────────────────
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS search_documents (
-  doc_id      TEXT PRIMARY KEY,
-  title       TEXT NOT NULL,
-  content     TEXT NOT NULL,
-  category    TEXT DEFAULT 'general',
-  url         TEXT,
-  metadata    TEXT DEFAULT '{}',
-  indexed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-`;
-
-async function ensureSchema(env) {
-  try {
-    await env.SEARCH_DB.exec(SCHEMA);
-  } catch (_) {
-    // table already exists — ignore
-  }
+// ─────────────────────────────────────────────
+// Schema bootstrap (idempotent)
+// ─────────────────────────────────────────────
+async function ensureSchema(db) {
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS search_documents (
+      id          TEXT PRIMARY KEY,
+      title       TEXT NOT NULL,
+      content     TEXT NOT NULL,
+      category    TEXT DEFAULT 'general',
+      metadata    TEXT DEFAULT '{}',
+      indexed_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_search_docs_category ON search_documents(category);
+    CREATE INDEX IF NOT EXISTS idx_search_docs_indexed  ON search_documents(indexed_at DESC);
+  `);
 }
 
-// ─── Admin auth ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Auth helpers
+// ─────────────────────────────────────────────
 function isAdmin(req, env) {
-  const key = req.headers.get('X-Search-Admin-Key') || req.headers.get('Authorization')?.replace('Bearer ', '');
-  return key && key === env.SEARCH_ADMIN_KEY;
+  const key =
+    req.headers.get('X-Search-Admin-Key') ||
+    (req.headers.get('Authorization') || '').replace(/^Bearer\s+/, '');
+  return key === env.SEARCH_ADMIN_KEY;
 }
 
-// ─── Embedding helper ─────────────────────────────────────────────────────────
-async function embed(env, texts) {
-  const resp = await env.AI.run(EMBED_MODEL, { text: texts });
-  return resp.data; // float[][]
+// ─────────────────────────────────────────────
+// Embedding helper
+// ─────────────────────────────────────────────
+async function embed(text, env) {
+  const resp = await env.AI.run(EMBED_MODEL, { text: [text] });
+  return resp.data[0]; // Float32Array / number[]
 }
 
-// ─── ROUTE: POST /index ───────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Document ID — deterministic from title+content
+// ─────────────────────────────────────────────
+async function makeDocId(title, content) {
+  const raw = title + '::' + content.slice(0, 256);
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+}
+
+// ─────────────────────────────────────────────
+// Chunk large content
+// ─────────────────────────────────────────────
+function chunkText(text, maxChars = 1500) {
+  if (text.length <= maxChars) return [text];
+  const chunks = [];
+  let start = 0;
+  while (start < text.length) {
+    let end = Math.min(start + maxChars, text.length);
+    if (end < text.length) {
+      const boundary = text.lastIndexOf(' ', end);
+      if (boundary > start) end = boundary;
+    }
+    chunks.push(text.slice(start, end).trim());
+    start = end;
+  }
+  return chunks.filter(Boolean);
+}
+
+// ─────────────────────────────────────────────
+// HANDLER: POST /index
+// ─────────────────────────────────────────────
 async function handleIndex(req, env) {
   if (!isAdmin(req, env)) return err('Unauthorized', 401);
-  await ensureSchema(env);
 
   let body;
   try { body = await req.json(); } catch { return err('Invalid JSON'); }
 
-  const docs = Array.isArray(body) ? body : [body];
-  if (!docs.length)           return err('No documents provided');
-  if (docs.length > MAX_BATCH) return err(`Max ${MAX_BATCH} docs per call`);
+  const docs = Array.isArray(body) ? body : body.documents ? body.documents : [body];
+  if (!docs.length || docs.length > 50) return err('Provide 1–50 documents');
+
+  await ensureSchema(env.SEARCH_DB);
 
   const results = [];
-  const errors  = [];
-
-  // Validate
   for (const doc of docs) {
-    if (!doc.id || !doc.title || !doc.content) {
-      errors.push({ id: doc.id || '(missing)', error: 'id, title, content are required' });
+    if (!doc.title || !doc.content) {
+      results.push({ ok: false, error: 'Missing title or content', doc });
+      continue;
     }
-  }
-  if (errors.length) return json({ success: false, errors }, 400);
 
-  // Embed all in one batch call
-  const texts = docs.map(d => `${d.title}\n\n${d.content}`);
-  let embeddings;
-  try {
-    embeddings = await embed(env, texts);
-  } catch (e) {
-    return err(`Embedding failed: ${e.message}`, 502);
-  }
+    const id = doc.id || (await makeDocId(doc.title, doc.content));
+    const category = doc.category || 'general';
+    const metadata = doc.metadata || {};
+    const chunks = chunkText(doc.content);
 
-  // Upsert D1 + Vectorize
-  for (let i = 0; i < docs.length; i++) {
-    const doc = docs[i];
-    const vec = embeddings[i];
+    // Upsert into D1
+    await env.SEARCH_DB.prepare(
+      `INSERT OR REPLACE INTO search_documents (id, title, content, category, metadata, indexed_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(id, doc.title, doc.content, category, JSON.stringify(metadata), Date.now()).run();
 
-    try {
-      // D1 upsert
-      await env.SEARCH_DB.prepare(`
-        INSERT INTO search_documents (doc_id, title, content, category, url, metadata)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(doc_id) DO UPDATE SET
-          title=excluded.title,
-          content=excluded.content,
-          category=excluded.category,
-          url=excluded.url,
-          metadata=excluded.metadata,
-          indexed_at=CURRENT_TIMESTAMP
-      `).bind(
-        doc.id,
-        doc.title,
-        doc.content,
-        doc.category || 'general',
-        doc.url || null,
-        JSON.stringify(doc.metadata || {}),
-      ).run();
-
-      // Vectorize upsert
-      await env.VECTORIZE.upsert([{
-        id:       doc.id,
-        values:   vec,
+    // Embed each chunk and upsert into Vectorize
+    const vectors = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkText = `${doc.title}\n\n${chunks[i]}`;
+      const vector = await embed(chunkText, env);
+      vectors.push({
+        id: chunks.length > 1 ? `${id}_chunk${i}` : id,
+        values: Array.from(vector),
         metadata: {
-          title:    doc.title,
-          category: doc.category || 'general',
-          url:      doc.url || '',
+          doc_id: id,
+          title: doc.title,
+          category,
+          chunk_index: i,
+          total_chunks: chunks.length,
         },
-      }]);
-
-      results.push({ id: doc.id, status: 'indexed' });
-    } catch (e) {
-      errors.push({ id: doc.id, error: e.message });
+      });
     }
+
+    await env.VECTORIZE.upsert(vectors);
+    results.push({ ok: true, id, title: doc.title, chunks: chunks.length });
   }
 
-  return json({
-    success: true,
-    indexed: results.length,
-    errors:  errors.length,
-    results,
-    ...(errors.length ? { errors } : {}),
-  });
+  return json({ ok: true, indexed: results.filter(r => r.ok).length, results });
 }
 
-// ─── ROUTE: DELETE /index/:id ─────────────────────────────────────────────────
-async function handleDeleteDoc(req, env, docId) {
+// ─────────────────────────────────────────────
+// HANDLER: DELETE /index/:id
+// ─────────────────────────────────────────────
+async function handleDeleteDoc(req, env, id) {
   if (!isAdmin(req, env)) return err('Unauthorized', 401);
-  await ensureSchema(env);
+  await ensureSchema(env.SEARCH_DB);
 
+  // Delete from D1
+  await env.SEARCH_DB.prepare('DELETE FROM search_documents WHERE id = ?').bind(id).run();
+
+  // Delete all chunks from Vectorize
   try {
-    await env.SEARCH_DB.prepare('DELETE FROM search_documents WHERE doc_id = ?').bind(docId).run();
-    await env.VECTORIZE.deleteByIds([docId]);
-    return json({ success: true, deleted: docId });
-  } catch (e) {
-    return err(e.message, 500);
-  }
+    await env.VECTORIZE.deleteByIds([id, ...Array.from({ length: 20 }, (_, i) => `${id}_chunk${i}`)]);
+  } catch (_) {/* Vectorize delete is best-effort */}
+
+  return json({ ok: true, deleted: id });
 }
 
-// ─── ROUTE: POST /search  /  GET /search?q= ──────────────────────────────────
-async function handleSearch(req, env, url) {
-  await ensureSchema(env);
+// ─────────────────────────────────────────────
+// HANDLER: POST /search  or  GET /search?q=
+// ─────────────────────────────────────────────
+async function handleSearch(req, env) {
+  await ensureSchema(env.SEARCH_DB);
 
-  let query, topK, threshold, category;
+  let query, top_k = 10, threshold = 0.5, category;
 
   if (req.method === 'GET') {
-    query     = url.searchParams.get('q') || '';
-    topK      = parseInt(url.searchParams.get('top_k')  || String(DEFAULT_TOP_K));
-    threshold = parseFloat(url.searchParams.get('threshold') || String(DEFAULT_THRESHOLD));
-    category  = url.searchParams.get('category') || null;
+    const url = new URL(req.url);
+    query = url.searchParams.get('q') || '';
+    top_k = parseInt(url.searchParams.get('top_k') || '10', 10);
+    threshold = parseFloat(url.searchParams.get('threshold') || '0.5');
+    category = url.searchParams.get('category') || undefined;
   } else {
     let body;
     try { body = await req.json(); } catch { return err('Invalid JSON'); }
-    query     = body.query      || '';
-    topK      = body.top_k      || DEFAULT_TOP_K;
-    threshold = body.threshold  ?? DEFAULT_THRESHOLD;
-    category  = body.category   || null;
+    query = body.query || body.q || '';
+    top_k = body.top_k || 10;
+    threshold = body.threshold ?? 0.5;
+    category = body.category;
   }
 
-  if (!query.trim()) return err('query is required');
+  if (!query.trim()) return err('Missing query');
+  top_k = Math.min(Math.max(top_k, 1), 50);
 
-  // Embed query
-  let qVec;
-  try {
-    const embs = await embed(env, [query]);
-    qVec = embs[0];
-  } catch (e) {
-    return err(`Embedding failed: ${e.message}`, 502);
+  const queryVector = await embed(query, env);
+
+  const vectorFilter = category ? { category: { $eq: category } } : undefined;
+  const vectorResults = await env.VECTORIZE.query(Array.from(queryVector), {
+    topK: top_k * 2, // over-fetch to account for chunk dedup
+    returnMetadata: 'indexed',
+    filter: vectorFilter,
+  });
+
+  // Deduplicate by doc_id, keep best score per doc
+  const seen = new Map();
+  for (const match of vectorResults.matches || []) {
+    if (match.score < threshold) continue;
+    const docId = match.metadata?.doc_id || match.id;
+    if (!seen.has(docId) || seen.get(docId).score < match.score) {
+      seen.set(docId, { score: match.score, meta: match.metadata });
+    }
   }
 
-  // Vectorize query
-  const filter = category ? { category: { $eq: category } } : undefined;
-  let vecResults;
-  try {
-    vecResults = await env.VECTORIZE.query(qVec, {
-      topK:            topK,
-      returnMetadata:  'all',
-      ...(filter ? { filter } : {}),
-    });
-  } catch (e) {
-    return err(`Vector search failed: ${e.message}`, 502);
+  // Sort by score desc, limit to top_k
+  const ranked = [...seen.entries()]
+    .sort((a, b) => b[1].score - a[1].score)
+    .slice(0, top_k);
+
+  if (!ranked.length) {
+    return json({ ok: true, query, results: [], total: 0 });
   }
 
-  const matches = (vecResults.matches || []).filter(m => m.score >= threshold);
+  // Fetch full docs from D1
+  const ids = ranked.map(([id]) => id);
+  const placeholders = ids.map(() => '?').join(',');
+  const { results: dbRows } = await env.SEARCH_DB.prepare(
+    `SELECT id, title, content, category, metadata, indexed_at FROM search_documents WHERE id IN (${placeholders})`
+  ).bind(...ids).all();
 
-  // Enrich from D1
-  const enriched = await Promise.all(matches.map(async m => {
-    let extra = null;
-    try {
-      const row = await env.SEARCH_DB.prepare(
-        'SELECT title, content, category, url, metadata FROM search_documents WHERE doc_id = ?'
-      ).bind(m.id).first();
-      if (row) {
-        extra = {
-          content:  row.content,
-          category: row.category,
-          url:      row.url,
-          metadata: JSON.parse(row.metadata || '{}'),
-        };
-      }
-    } catch (_) {}
+  const docMap = new Map(dbRows.map(r => [r.id, r]));
 
+  const output = ranked.map(([id, { score }]) => {
+    const doc = docMap.get(id) || {};
     return {
-      id:       m.id,
-      score:    Math.round(m.score * 1000) / 1000,
-      title:    m.metadata?.title || extra?.title || m.id,
-      category: extra?.category || m.metadata?.category || 'general',
-      url:      extra?.url || m.metadata?.url || null,
-      excerpt:  extra?.content ? extra.content.slice(0, 280) + (extra.content.length > 280 ? '…' : '') : null,
-      metadata: extra?.metadata || {},
+      id,
+      score: Math.round(score * 1000) / 1000,
+      title: doc.title || 'Unknown',
+      excerpt: (doc.content || '').slice(0, 300) + ((doc.content || '').length > 300 ? '…' : ''),
+      category: doc.category || 'general',
+      metadata: JSON.parse(doc.metadata || '{}'),
+      indexed_at: doc.indexed_at,
     };
-  }));
-
-  return json({
-    success: true,
-    query,
-    count:   enriched.length,
-    results: enriched,
   });
+
+  return json({ ok: true, query, results: output, total: output.length });
 }
 
-// ─── ROUTE: POST /ai/ask ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// HANDLER: POST /ai/ask  or  GET /ai/ask?q=
+// ─────────────────────────────────────────────
 async function handleAsk(req, env) {
-  await ensureSchema(env);
+  await ensureSchema(env.SEARCH_DB);
 
-  let body;
-  try { body = await req.json(); } catch { return err('Invalid JSON'); }
+  let question, top_k = 5, category;
 
-  const { question, top_k = DEFAULT_TOP_K, category } = body;
-  if (!question?.trim()) return err('question is required');
-
-  // Embed question
-  let qVec;
-  try {
-    const embs = await embed(env, [question]);
-    qVec = embs[0];
-  } catch (e) {
-    return err(`Embedding failed: ${e.message}`, 502);
+  if (req.method === 'GET') {
+    const url = new URL(req.url);
+    question = url.searchParams.get('q') || '';
+    top_k = parseInt(url.searchParams.get('top_k') || '5', 10);
+    category = url.searchParams.get('category') || undefined;
+  } else {
+    let body;
+    try { body = await req.json(); } catch { return err('Invalid JSON'); }
+    question = body.question || body.q || body.query || '';
+    top_k = body.top_k || 5;
+    category = body.category;
   }
 
-  // Retrieve context from Vectorize
-  const filter = category ? { category: { $eq: category } } : undefined;
-  let vecResults;
-  try {
-    vecResults = await env.VECTORIZE.query(qVec, {
-      topK:           top_k,
-      returnMetadata: 'all',
-      ...(filter ? { filter } : {}),
+  if (!question.trim()) return err('Missing question');
+  top_k = Math.min(Math.max(top_k, 1), 20);
+
+  // Step 1: Semantic search
+  const queryVector = await embed(question, env);
+  const vectorFilter = category ? { category: { $eq: category } } : undefined;
+  const vectorResults = await env.VECTORIZE.query(Array.from(queryVector), {
+    topK: top_k * 2,
+    returnMetadata: 'indexed',
+    filter: vectorFilter,
+  });
+
+  // Deduplicate docs
+  const seen = new Map();
+  for (const match of vectorResults.matches || []) {
+    if (match.score < 0.4) continue;
+    const docId = match.metadata?.doc_id || match.id;
+    if (!seen.has(docId) || seen.get(docId) < match.score) {
+      seen.set(docId, match.score);
+    }
+  }
+
+  const ranked = [...seen.entries()].sort((a, b) => b[1] - a[1]).slice(0, top_k);
+  let context = '';
+  let sources = [];
+
+  if (ranked.length > 0) {
+    const ids = ranked.map(([id]) => id);
+    const placeholders = ids.map(() => '?').join(',');
+    const { results: dbRows } = await env.SEARCH_DB.prepare(
+      `SELECT id, title, content, category FROM search_documents WHERE id IN (${placeholders})`
+    ).bind(...ids).all();
+
+    const docMap = new Map(dbRows.map(r => [r.id, r]));
+    sources = ranked.map(([id, score]) => {
+      const doc = docMap.get(id) || {};
+      return { id, title: doc.title || 'Unknown', category: doc.category, score };
     });
-  } catch (e) {
-    return err(`Vector search failed: ${e.message}`, 502);
+
+    context = ranked
+      .map(([id]) => {
+        const doc = docMap.get(id);
+        if (!doc) return '';
+        return `### ${doc.title}\n${doc.content.slice(0, 1200)}`;
+      })
+      .filter(Boolean)
+      .join('\n\n---\n\n');
   }
 
-  // Fetch full content from D1
-  const contextParts = [];
-  const sources = [];
-  for (const m of (vecResults.matches || [])) {
-    try {
-      const row = await env.SEARCH_DB.prepare(
-        'SELECT title, content, url FROM search_documents WHERE doc_id = ?'
-      ).bind(m.id).first();
-      if (row) {
-        contextParts.push(`### ${row.title}\n${row.content}`);
-        sources.push({ id: m.id, title: row.title, url: row.url, score: m.score });
-      }
-    } catch (_) {}
-  }
+  // Step 2: Generate answer with LLM
+  const systemPrompt = context
+    ? `You are a helpful AI assistant for Bervashun / Knockoutforever. Answer the user's question based on the provided context. Be concise, accurate, and cite relevant sections when possible. If the context doesn't contain the answer, say so clearly.`
+    : `You are a helpful AI assistant. Answer the user's question to the best of your ability.`;
 
-  const context = contextParts.join('\n\n---\n\n') || 'No relevant documents found.';
+  const userMessage = context
+    ? `Context:\n${context}\n\n---\n\nQuestion: ${question}`
+    : question;
 
-  // LLM answer
-  const prompt = `You are a precise, helpful assistant. Answer the question using ONLY the context below.
-If the answer is not in the context, say "I don't have enough information to answer that."
+  const llmResp = await env.AI.run(LLM_MODEL, {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userMessage },
+    ],
+    max_tokens: 1024,
+    temperature: 0.3,
+  });
 
-<context>
-${context}
-</context>
-
-Question: ${question}
-Answer:`;
-
-  let answer = '';
-  try {
-    const llmResp = await env.AI.run(LLM_MODEL, {
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 512,
-    });
-    answer = llmResp.response || llmResp.result?.response || '';
-  } catch (e) {
-    return err(`LLM failed: ${e.message}`, 502);
-  }
+  const answer = llmResp.response || llmResp.result?.response || 'Unable to generate answer.';
 
   return json({
-    success: true,
+    ok: true,
     question,
-    answer: answer.trim(),
+    answer,
     sources,
+    context_used: ranked.length > 0,
   });
 }
 
-// ─── ROUTE: GET /documents ────────────────────────────────────────────────────
-async function handleListDocuments(req, env, url) {
+// ─────────────────────────────────────────────
+// HANDLER: GET /documents  (admin)
+// ─────────────────────────────────────────────
+async function handleListDocs(req, env) {
   if (!isAdmin(req, env)) return err('Unauthorized', 401);
-  await ensureSchema(env);
+  await ensureSchema(env.SEARCH_DB);
 
-  const limit  = parseInt(url.searchParams.get('limit')  || '100');
-  const offset = parseInt(url.searchParams.get('offset') || '0');
-  const cat    = url.searchParams.get('category') || null;
+  const url = new URL(req.url);
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
+  const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+  const category = url.searchParams.get('category');
 
-  try {
-    const query = cat
-      ? 'SELECT doc_id, title, category, url, indexed_at FROM search_documents WHERE category = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?'
-      : 'SELECT doc_id, title, category, url, indexed_at FROM search_documents ORDER BY indexed_at DESC LIMIT ? OFFSET ?';
-
-    const result = cat
-      ? await env.SEARCH_DB.prepare(query).bind(cat, limit, offset).all()
-      : await env.SEARCH_DB.prepare(query).bind(limit, offset).all();
-
-    const countResult = cat
-      ? await env.SEARCH_DB.prepare('SELECT COUNT(*) as total FROM search_documents WHERE category = ?').bind(cat).first()
-      : await env.SEARCH_DB.prepare('SELECT COUNT(*) as total FROM search_documents').first();
-
-    return json({
-      success: true,
-      total:   countResult?.total || 0,
-      limit,
-      offset,
-      documents: result.results || [],
-    });
-  } catch (e) {
-    return err(e.message, 500);
+  let stmt;
+  if (category) {
+    stmt = env.SEARCH_DB.prepare(
+      `SELECT id, title, category, LENGTH(content) as content_length, metadata, indexed_at
+       FROM search_documents WHERE category = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?`
+    ).bind(category, limit, offset);
+  } else {
+    stmt = env.SEARCH_DB.prepare(
+      `SELECT id, title, category, LENGTH(content) as content_length, metadata, indexed_at
+       FROM search_documents ORDER BY indexed_at DESC LIMIT ? OFFSET ?`
+    ).bind(limit, offset);
   }
-}
 
-// ─── ROUTE: DELETE /documents ─────────────────────────────────────────────────
-async function handlePurgeDocuments(req, env) {
-  if (!isAdmin(req, env)) return err('Unauthorized', 401);
-  await ensureSchema(env);
+  const { results } = await stmt.all();
+  const { results: countRes } = await env.SEARCH_DB.prepare(
+    `SELECT COUNT(*) as total FROM search_documents${category ? ' WHERE category = ?' : ''}`
+  ).bind(...(category ? [category] : [])).all();
 
-  try {
-    // Get all IDs first
-    const rows = await env.SEARCH_DB.prepare('SELECT doc_id FROM search_documents').all();
-    const ids  = (rows.results || []).map(r => r.doc_id);
-
-    await env.SEARCH_DB.prepare('DELETE FROM search_documents').run();
-    if (ids.length) await env.VECTORIZE.deleteByIds(ids);
-
-    return json({ success: true, purged: ids.length });
-  } catch (e) {
-    return err(e.message, 500);
-  }
-}
-
-// ─── ROUTE: GET /health ───────────────────────────────────────────────────────
-function handleHealth() {
   return json({
-    success: true,
-    service: 'ai-search',
-    version: '1.0.0',
-    timestamp: new Date().toISOString(),
-    models: { embedding: EMBED_MODEL, llm: LLM_MODEL },
+    ok: true,
+    total: countRes[0]?.total || 0,
+    limit,
+    offset,
+    documents: results.map(r => ({
+      ...r,
+      metadata: JSON.parse(r.metadata || '{}'),
+    })),
   });
 }
 
-// ─── MAIN HANDLER ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// HANDLER: DELETE /documents  (admin purge-all)
+// ─────────────────────────────────────────────
+async function handlePurgeDocs(req, env) {
+  if (!isAdmin(req, env)) return err('Unauthorized', 401);
+  await ensureSchema(env.SEARCH_DB);
+  await env.SEARCH_DB.prepare('DELETE FROM search_documents').run();
+  // Vectorize doesn't have a bulk-delete endpoint; docs will become stale (orphaned)
+  return json({ ok: true, message: 'All documents purged from D1. Vectorize vectors are stale until re-indexed.' });
+}
+
+// ─────────────────────────────────────────────
+// HANDLER: GET /health
+// ─────────────────────────────────────────────
+async function handleHealth(env) {
+  let dbOk = false;
+  let docCount = 0;
+  try {
+    await ensureSchema(env.SEARCH_DB);
+    const { results } = await env.SEARCH_DB.prepare('SELECT COUNT(*) as c FROM search_documents').all();
+    docCount = results[0]?.c || 0;
+    dbOk = true;
+  } catch (_) {}
+
+  return json({
+    ok: true,
+    status: 'healthy',
+    version: '2.0',
+    service: 'ai-search',
+    worker: 'ai-search',
+    db: dbOk ? 'connected' : 'error',
+    documents_indexed: docCount,
+    models: {
+      embedding: EMBED_MODEL,
+      llm: LLM_MODEL,
+      dimensions: EMBED_DIMS,
+    },
+    ts: new Date().toISOString(),
+  });
+}
+
+// ─────────────────────────────────────────────
+// MAIN FETCH HANDLER
+// ─────────────────────────────────────────────
 export default {
-  async fetch(req, env, _ctx) {
-    const url    = new URL(req.url);
-    const path   = url.pathname.replace(/\/$/, '') || '/';
-    const method = req.method.toUpperCase();
-
+  async fetch(request, env) {
     // Preflight
-    if (method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS });
     }
 
-    // ── GET /health ──────────────────────────────────────────────────────────
-    if (path === '/health' && method === 'GET') {
-      return handleHealth();
-    }
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/$/, '') || '/';
+    const method = request.method;
 
-    // ── POST /index ──────────────────────────────────────────────────────────
-    if (path === '/index' && method === 'POST') {
-      return handleIndex(req, env);
-    }
+    try {
+      // Health
+      if (path === '/health' && method === 'GET') return handleHealth(env);
 
-    // ── DELETE /index/:id ────────────────────────────────────────────────────
-    const deleteMatch = path.match(/^\/index\/(.+)$/);
-    if (deleteMatch && method === 'DELETE') {
-      return handleDeleteDoc(req, env, decodeURIComponent(deleteMatch[1]));
-    }
+      // Indexing
+      if (path === '/index' && method === 'POST') return handleIndex(request, env);
 
-    // ── POST /search  OR  GET /search?q= ────────────────────────────────────
-    if (path === '/search' && (method === 'POST' || method === 'GET')) {
-      return handleSearch(req, env, url);
-    }
+      // Delete single doc
+      const delMatch = path.match(/^\/index\/(.+)$/);
+      if (delMatch && method === 'DELETE') return handleDeleteDoc(request, env, delMatch[1]);
 
-    // ── POST /ai/ask ─────────────────────────────────────────────────────────
-    if (path === '/ai/ask' && method === 'POST') {
-      return handleAsk(req, env);
-    }
+      // Search
+      if (path === '/search' && (method === 'GET' || method === 'POST')) return handleSearch(request, env);
 
-    // ── GET /documents ───────────────────────────────────────────────────────
-    if (path === '/documents' && method === 'GET') {
-      return handleListDocuments(req, env, url);
-    }
+      // AI ask / RAG
+      if (path === '/ai/ask' && (method === 'GET' || method === 'POST')) return handleAsk(request, env);
 
-    // ── DELETE /documents ────────────────────────────────────────────────────
-    if (path === '/documents' && method === 'DELETE') {
-      return handlePurgeDocuments(req, env);
-    }
+      // List documents (admin)
+      if (path === '/documents' && method === 'GET') return handleListDocs(request, env);
 
-    return err('Not Found', 404);
+      // Purge all (admin)
+      if (path === '/documents' && method === 'DELETE') return handlePurgeDocs(request, env);
+
+      // Root — mini API reference
+      if (path === '/' || path === '') {
+        return json({
+          service: 'AI Search',
+          version: '2.0',
+          endpoints: {
+            'POST /index': 'Ingest documents (admin)',
+            'DELETE /index/:id': 'Remove a document (admin)',
+            'POST /search': 'Semantic search { query, top_k?, threshold?, category? }',
+            'GET /search?q=': 'Semantic search (browser)',
+            'POST /ai/ask': 'RAG answer { question, top_k?, category? }',
+            'GET /ai/ask?q=': 'RAG answer (browser)',
+            'GET /documents': 'List indexed docs (admin)',
+            'DELETE /documents': 'Purge all docs (admin)',
+            'GET /health': 'Liveness check',
+          },
+        });
+      }
+
+      return err('Not found', 404);
+    } catch (e) {
+      console.error('ai-search error:', e);
+      return err('Internal server error: ' + (e?.message || 'unknown'), 500);
+    }
   },
 };
