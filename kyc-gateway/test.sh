@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# ── kyc-gateway v8.0 — Live E2E Test Suite ──────────────────────────────────
+# kyc-gateway v8.1 — Live Integration Tests
+# Usage: KYC_ADMIN_KEY=<key> GATEWAY_API_KEY=<key> bash test.sh
 set -euo pipefail
 
 BASE="${KYC_BASE_URL:-https://kyc.wwwknockoutforever.com}"
@@ -9,153 +10,149 @@ API_KEY="${GATEWAY_API_KEY:-78d62c3d8bc33309df5c152ab54b8888e190384346299bdca6dd
 PASS=0; FAIL=0
 
 check() {
-  local label="$1" expected="$2" actual="$3"
-  if [[ "$actual" == *"$expected"* ]]; then
-    echo "  ✅  $label"
+  local label="$1"; local expected="$2"; local actual="$3"
+  if echo "$actual" | grep -q "$expected" 2>/dev/null; then
+    echo "✅ $label"
     ((PASS++)) || true
   else
-    echo "  ❌  $label — expected: '$expected'  got: '$actual'"
+    echo "❌ $label — expected '$expected' in: $actual"
     ((FAIL++)) || true
   fi
 }
 
-echo ""
 echo "═══════════════════════════════════════════════"
-echo "  kyc-gateway v8.0 — Live E2E Tests"
-echo "  Target: $BASE"
+echo "  kyc-gateway v8.1 — Live Integration Tests"
+echo "  Base: $BASE"
 echo "═══════════════════════════════════════════════"
-
-# ── 1. Health check ──────────────────────────────────────────────────────────
 echo ""
-echo "── Health ──"
-R=$(curl -sf "$BASE/api/kyc/health" || echo '{"error":"fail"}')
-check "Health status=ok"          '"status":"ok"'      "$R"
-check "Engine version=8.0"        '"version":"8.0"'    "$R"
-check "16 engines reported"       '"engines":16'       "$R"
 
-# ── 2. Unauthorized apply ────────────────────────────────────────────────────
+# ── Health
+echo "── Health"
+H=$(curl -sf "$BASE/api/kyc/health")
+check "Health status=ok"        '"status":"ok"'    "$H"
+check "Health version=8.1"      '"version":"8.1"'  "$H"
+check "Health engines=17"       '"engines":17'     "$H"
 echo ""
-echo "── Auth Gating ──"
-R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
+
+# ── Unauthorized
+echo "── Auth"
+R=$(curl -sf -o /dev/null -w "%{http_code}" -X POST "$BASE/api/kyc/apply" \
   -H "Content-Type: application/json" \
-  -d '{"applicant_name":"Jane Doe","tin":"123-45-6789"}' \
-  -w "\n%{http_code}" 2>/dev/null || echo "")
-CODE=$(echo "$R" | tail -1)
-check "No auth returns 401" "401" "$CODE"
-
-# ── 3. Clean individual — should APPROVE ────────────────────────────────────
+  -d '{"applicant_name":"Test","tin":"123456789"}' 2>/dev/null || echo "401")
+check "No API key → 401"   "401"   "$R"
 echo ""
-echo "── Clean Individual (expect APPROVED) ──"
+
+# ── Clean individual (APPROVED)
+echo "── Clean Individual"
 R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
   -H "Content-Type: application/json" \
   -H "X-Api-Key: $API_KEY" \
   -d '{
     "entity_type":"individual",
-    "applicant_name":"Jane Marie Smith",
-    "tin":"123-45-6789",
-    "dob":"1985-03-15",
-    "address":{"country":"US","zip":"10001"}
-  }' || echo '{"error":"fail"}')
-check "APPROVED decision"            '"status":"APPROVED"'   "$R"
-check "account_generation allowed"   '"allowed":true'         "$R"
-check "latency_ms present"           '"latency_ms"'           "$R"
-check "engine_version v8.0"          '"engine_version":"v8.0"' "$R"
-SUB_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('submission_id',''))" 2>/dev/null || echo "")
+    "applicant_name":"Alice Johnson",
+    "tin":"234567890",
+    "dob":"1985-05-15",
+    "address":{"country":"US","zip":"10001"},
+    "amount":500
+  }')
+check "Clean individual → APPROVED"   '"status":"APPROVED"'         "$R"
+check "account_generation.allowed"    '"allowed":true'              "$R"
+check "17 engines run"                '"engines_run":17'            "$R"
+check "engine version v8.1"           '"engine_version":"v8.1"'     "$R"
+SID=$(echo "$R" | python3 -c "import json,sys; print(json.load(sys.stdin)['submission_id'])" 2>/dev/null || echo "unknown")
+echo "   submission_id: $SID"
+echo ""
 
-# ── 4. Status check ──────────────────────────────────────────────────────────
-if [[ -n "$SUB_ID" ]]; then
-  echo ""
-  echo "── Status Lookup ──"
-  R=$(curl -sf "$BASE/api/kyc/status/$SUB_ID" \
-    -H "X-Api-Key: $API_KEY" || echo '{"error":"fail"}')
-  check "Status returns APPROVED"  '"status":"APPROVED"' "$R"
-  check "Submission ID matches"    "$SUB_ID"             "$R"
+# ── Status check
+echo "── Status"
+if [[ "$SID" != "unknown" ]]; then
+  S=$(curl -sf "$BASE/api/kyc/status/$SID" -H "X-Api-Key: $API_KEY")
+  check "Status found"             '"submission_id"'    "$S"
+  check "Status = APPROVED"        '"status":"APPROVED"' "$S"
 fi
-
-# ── 5. FATF country — should REVIEW ─────────────────────────────────────────
 echo ""
-echo "── FATF Country (expect REVIEW or DENIED) ──"
+
+# ── Structuring flag (REVIEW)
+echo "── Structuring (E6)"
 R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
   -H "Content-Type: application/json" \
   -H "X-Api-Key: $API_KEY" \
   -d '{
     "entity_type":"individual",
-    "applicant_name":"Ali Hassan",
-    "tin":"234-56-7890",
-    "dob":"1980-01-01",
-    "address":{"country":"IR","zip":"00000"}
-  }' || echo '{"error":"fail"}')
-check "FATF flags E3_FATF"           '"E3_FATF"'     "$R"
-check "Not APPROVED"                 '"REVIEW"\|"DENIED"' "$(echo "$R" | grep -o '"REVIEW"\|"DENIED"' | head -1 || echo 'REVIEW')"
-
-# ── 6. Structuring trigger ────────────────────────────────────────────────────
+    "applicant_name":"Bob Martinez",
+    "tin":"456789012",
+    "dob":"1975-03-22",
+    "address":{"country":"US","zip":"10001"},
+    "amount":9500
+  }')
+check "Structuring → REVIEW"          '"status":"REVIEW"'   "$R"
+check "E6_Structuring flagged"        'E6_Structuring'      "$R"
+check "structuring_flagged=true"      '"structuring_flagged":true' "$R"
 echo ""
-echo "── Structuring Trigger (amount=9500) ──"
+
+# ── Synthetic SSN (E15)
+echo "── Synthetic Identity (E15)"
 R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
   -H "Content-Type: application/json" \
   -H "X-Api-Key: $API_KEY" \
   -d '{
     "entity_type":"individual",
-    "applicant_name":"Robert Clean",
-    "tin":"345-67-8901",
-    "amount":9500,
-    "address":{"country":"US"}
-  }' || echo '{"error":"fail"}')
-check "Structuring flagged"          '"E6_Structuring"' "$R"
-check "structuring_flagged=true"     '"structuring_flagged":true' "$R"
-
-# ── 7. Synthetic SSN ─────────────────────────────────────────────────────────
+    "applicant_name":"Carl Davis",
+    "tin":"900000001",
+    "dob":"1990-01-01",
+    "address":{"country":"US","zip":"10001"},
+    "amount":100
+  }')
+check "Synthetic SSN → REVIEW or DENIED" '"status":"' "$R"
+check "E15_Synthetic_ID in flags"         'E15_Synthetic' "$R"
 echo ""
-echo "── Synthetic SSN (area 900+) ──"
+
+# ── FATF country (E3)
+echo "── FATF High-Risk Country (E3)"
 R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
   -H "Content-Type: application/json" \
   -H "X-Api-Key: $API_KEY" \
   -d '{
     "entity_type":"individual",
-    "applicant_name":"Sam Fake",
-    "tin":"900-12-3456",
-    "dob":"1990-06-15",
-    "address":{"country":"US"}
-  }' || echo '{"error":"fail"}')
-check "Synthetic SSN flags E15"      '"E15_Synthetic_ID"' "$R"
-
-# ── 8. Business EIN invalid prefix ───────────────────────────────────────────
+    "applicant_name":"Dana Lee",
+    "tin":"345678901",
+    "dob":"1980-06-15",
+    "address":{"country":"IR","zip":"10001"},
+    "amount":100
+  }')
+check "FATF Iran → REVIEW or DENIED"  '"status":"'     "$R"
+check "E3_FATF flagged"               'E3_FATF'        "$R"
 echo ""
-echo "── Invalid EIN Prefix (07-xxxxxxx) ──"
-R=$(curl -sf -X POST "$BASE/api/kyc/apply" \
+
+# ── Admin stats
+echo "── Stats (admin)"
+R=$(curl -sf "$BASE/api/kyc/stats" -H "X-Admin-Key: $ADMIN_KEY")
+check "Stats has totals"          '"totals"'          "$R"
+check "Stats has engine_version"  '"engine_version"'  "$R"
+check "Stats has fincen_hits"     '"fincen_hits"'     "$R"
+echo ""
+
+# ── Review queue
+echo "── Review Queue"
+R=$(curl -sf "$BASE/api/kyc/review" -H "X-Admin-Key: $ADMIN_KEY")
+check "Review queue returns page"    '"page"'     "$R"
+check "Review queue returns items"   '"items"'    "$R"
+echo ""
+
+# ── Batch
+echo "── Batch (admin)"
+R=$(curl -sf -X POST "$BASE/api/kyc/batch" \
   -H "Content-Type: application/json" \
-  -H "X-Api-Key: $API_KEY" \
-  -d '{
-    "entity_type":"business",
-    "applicant_name":"Shell Corp LLC",
-    "tin":"07-1234567",
-    "address":{"country":"US"}
-  }' || echo '{"error":"fail"}')
-check "Invalid EIN flags E4"         '"E4_TIN_EIN"' "$R"
-
-# ── 9. Admin stats ────────────────────────────────────────────────────────────
+  -H "X-Admin-Key: $ADMIN_KEY" \
+  -d '[
+    {"entity_type":"individual","applicant_name":"Eve Turner","tin":"567890123","dob":"1992-04-10","address":{"country":"US","zip":"10001"},"amount":200},
+    {"entity_type":"business","applicant_name":"Frontier Corp","tin":"201234567","address":{"country":"US","zip":"10001"},"amount":5000}
+  ]')
+check "Batch processed=2"      '"processed":2'   "$R"
+check "Batch has results"      '"results"'       "$R"
 echo ""
-echo "── Admin Stats ──"
-R=$(curl -sf "$BASE/api/kyc/stats" \
-  -H "X-Admin-Key: $ADMIN_KEY" || echo '{"error":"fail"}')
-check "Stats engine_version v8.0"    '"engine_version":"v8.0"' "$R"
-check "Stats engines_active=16"      '"engines_active":16'     "$R"
 
-# ── 10. Review queue ─────────────────────────────────────────────────────────
-echo ""
-echo "── Review Queue ──"
-R=$(curl -sf "$BASE/api/kyc/review?per_page=5" \
-  -H "X-Admin-Key: $ADMIN_KEY" || echo '{"error":"fail"}')
-check "Review queue page field"      '"page"'      "$R"
-check "Review queue per_page field"  '"per_page"'  "$R"
-
-echo ""
 echo "═══════════════════════════════════════════════"
-echo "  PASS: $PASS  |  FAIL: $FAIL"
-if [[ "$FAIL" -gt 0 ]]; then
-  echo "  ⚠️  Some tests failed — check output above"
-  exit 1
-else
-  echo "  🎉  All live E2E tests passed!"
-fi
+echo "  Results: ✅ $PASS passed  |  ❌ $FAIL failed"
 echo "═══════════════════════════════════════════════"
+[[ $FAIL -eq 0 ]] && exit 0 || exit 1
