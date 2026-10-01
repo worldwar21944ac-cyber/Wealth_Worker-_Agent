@@ -18,7 +18,7 @@ jobs:
         with:
           node-version: '22'
       - name: Run unit tests (179 assertions)
-        run: node kyc-gateway/unit_test.js
+        run: node kyc-gateway/unit_test.cjs
 
   deploy:
     needs: test
