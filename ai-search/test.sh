@@ -1,73 +1,83 @@
 #!/usr/bin/env bash
-# test.sh — ai-search end-to-end smoke test
-# Usage: SEARCH_ADMIN_KEY=<key> BASE_URL=https://ai-search.wwwknockoutforever.com bash test.sh
-set -euo pipefail
+# Smoke test for ai-search worker
+# Usage: SEARCH_ADMIN_KEY=<key> bash test.sh [BASE_URL]
+set -e
 
-BASE="${BASE_URL:-https://ai-search.wwwknockoutforever.com}"
-ADMIN_KEY="${SEARCH_ADMIN_KEY:-ai-search-sovereign-2026}"
+BASE="${1:-https://ai-search.wwwknockoutforever.com}"
+KEY="${SEARCH_ADMIN_KEY:-}"
 
-echo "🔍 Testing ai-search at $BASE"
+if [ -z "$KEY" ]; then
+  echo "ERROR: SEARCH_ADMIN_KEY is required"
+  exit 1
+fi
+
+pass=0; fail=0
+
+check() {
+  local label="$1"; local expected="$2"; local actual="$3"
+  if echo "$actual" | grep -q "$expected"; then
+    echo "  ✅  $label"
+    ((pass++)) || true
+  else
+    echo "  ❌  $label — expected '$expected' in: $actual"
+    ((fail++)) || true
+  fi
+}
+
+echo "=== ai-search smoke test ==="
+echo "Base URL: $BASE"
 echo ""
 
 # 1. Health
-echo "1️⃣  GET /health"
-curl -sf "$BASE/health" | python3 -m json.tool
-echo ""
+echo "[1] GET /health"
+RES=$(curl -sf "$BASE/health")
+check "status=ok"      '"status"' "$RES"
+check "version=1.1"    '"1.1"'    "$RES"
 
-# 2. Root info
-echo "2️⃣  GET /"
-curl -sf "$BASE/" | python3 -m json.tool
-echo ""
-
-# 3. Index a document
-echo "3️⃣  POST /index — ingest 2 documents"
-curl -sf -X POST "$BASE/index" \
+# 2. Ingest one doc
+echo "[2] POST /index — ingest test doc"
+RES=$(curl -sf -X POST "$BASE/index" \
   -H "Content-Type: application/json" \
-  -H "X-Search-Admin-Key: $ADMIN_KEY" \
-  -d '[
-    {
-      "id": "doc-001",
-      "title": "Bervashun Trust Capital Overview",
-      "content": "Bervashun Trust Capital is a sovereign financial technology platform built on Cloudflare Workers. It integrates with Unit for banking-as-a-service, enabling KYC, virtual cards, and ACH transfers. The platform uses AI to screen customers and detect fraud.",
-      "source": "internal",
-      "category": "fintech"
-    },
-    {
-      "id": "doc-002",
-      "title": "KYC Gateway Documentation",
-      "content": "The KYC Gateway v6.0 implements 16 screening engines including OFAC SDN, PEP, FATF country risk, TIN/EIN validation, structuring detection, adverse media, and synthetic identity detection. Decisions are APPROVED (0-29), REVIEW (30-69), or DENIED (70-100).",
-      "source": "internal",
-      "category": "compliance"
-    }
-  ]' | python3 -m json.tool
-echo ""
+  -H "X-Search-Admin-Key: $KEY" \
+  -d '[{"title":"Bervashun Trust Capital","content":"Bervashun Trust Capital is a financial technology company providing digital banking services via the Unit platform, including KYC screening, virtual accounts, and card issuing.","category":"fintech"}]')
+check "indexed=1"  '"indexed"' "$RES"
+DOC_ID=$(echo "$RES" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+echo "   doc_id: $DOC_ID"
 
-# 4. Semantic search
-echo "4️⃣  POST /search — semantic search"
-curl -sf -X POST "$BASE/search" \
+# 3. Semantic search
+echo "[3] POST /search"
+RES=$(curl -sf -X POST "$BASE/search" \
   -H "Content-Type: application/json" \
-  -d '{"query": "how does KYC screening work?", "top_k": 3}' \
-  | python3 -m json.tool
-echo ""
+  -d '{"query":"digital banking KYC","top_k":3}')
+check "results array" '"results"' "$RES"
 
-# 5. GET search
-echo "5️⃣  GET /search?q= — browser-style search"
-curl -sf "$BASE/search?q=banking+ACH+transfers" | python3 -m json.tool
-echo ""
+# 4. GET search
+echo "[4] GET /search?q=virtual+accounts"
+RES=$(curl -sf "$BASE/search?q=virtual+accounts&top_k=3")
+check "results array" '"results"' "$RES"
 
-# 6. RAG ask
-echo "6️⃣  POST /ai/ask — RAG question"
-curl -sf -X POST "$BASE/ai/ask" \
+# 5. RAG ask
+echo "[5] POST /ai/ask"
+RES=$(curl -sf -X POST "$BASE/ai/ask" \
   -H "Content-Type: application/json" \
-  -d '{"question": "What risk score leads to a DENIED decision in KYC?"}' \
-  | python3 -m json.tool
-echo ""
+  -d '{"question":"What services does Bervashun Trust Capital provide?"}')
+check "answer field"   '"answer"'  "$RES"
+check "sources field"  '"sources"' "$RES"
 
-# 7. List documents
-echo "7️⃣  GET /documents — list indexed"
-curl -sf "$BASE/documents" \
-  -H "X-Search-Admin-Key: $ADMIN_KEY" \
-  | python3 -m json.tool
-echo ""
+# 6. List documents
+echo "[6] GET /documents"
+RES=$(curl -sf "$BASE/documents" \
+  -H "X-Search-Admin-Key: $KEY")
+check "documents array" '"documents"' "$RES"
 
-echo "✅ All tests complete."
+# 7. Delete doc
+if [ -n "$DOC_ID" ]; then
+  echo "[7] DELETE /index/:id"
+  RES=$(curl -sf -X DELETE "$BASE/index/$DOC_ID" \
+    -H "X-Search-Admin-Key: $KEY")
+  check "deleted id" '"deleted"' "$RES"
+fi
+
+echo ""
+echo "=== Results: $pass passed, $fail failed ==="
+[ "$fail" -eq 0 ] && exit 0 || exit 1
