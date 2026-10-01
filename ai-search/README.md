@@ -1,62 +1,88 @@
-# AI Search Worker v2.0
+# ai-search Worker v3.0
 
-Cloudflare Worker powering semantic search + RAG for Bervashun / Knockoutforever.
+Cloudflare Worker with semantic search + RAG (Retrieval-Augmented Generation).
 
-## Architecture
+## Stack
+- **Embedding**: `@cf/baai/bge-base-en-v1.5` (768-dim, Workers AI)
+- **Vector DB**: Cloudflare Vectorize (`ai-search-index`, cosine metric)
+- **LLM (RAG)**: `@cf/meta/llama-3.1-8b-instruct` (Workers AI)
+- **Metadata DB**: D1 (`bervashun-audit`)
+- **Domain**: `https://ai-search.wwwknockoutforever.com`
 
+## Deploy
+
+```bash
+# From your terminal (requires CF API token)
+bash deploy-now.sh <YOUR_CLOUDFLARE_API_TOKEN>
+
+# OR via GitHub Actions: add CLOUDFLARE_API_TOKEN to repo secrets
+# Settings → Secrets and variables → Actions → New repository secret
 ```
-Client ──► ai-search.wwwknockoutforever.com
-             │
-             ├── Workers AI (@cf/baai/bge-base-en-v1.5)   — 768-dim embeddings
-             ├── Vectorize (ai-search-index, cosine)        — vector store
-             ├── Workers AI (@cf/meta/llama-3.1-8b-instruct) — RAG LLM
-             └── D1 (bervashun-audit)                       — document store
-```
 
-## Endpoints
+## API Reference
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `POST` | `/index` | Admin | Ingest 1–50 documents |
-| `DELETE` | `/index/:id` | Admin | Remove a document |
-| `POST` | `/search` | Public | Semantic search |
-| `GET` | `/search?q=` | Public | Semantic search (browser) |
-| `POST` | `/ai/ask` | Public | RAG answer |
-| `GET` | `/ai/ask?q=` | Public | RAG answer (browser) |
-| `GET` | `/documents` | Admin | List indexed docs |
-| `DELETE` | `/documents` | Admin | Purge all docs |
-| `GET` | `/health` | Public | Liveness |
+| GET | `/health` | Public | Liveness check |
+| POST | `/index` | Admin | Ingest 1-50 documents |
+| DELETE | `/index/:id` | Admin | Remove a document |
+| POST | `/search` | Public | Semantic vector search |
+| GET | `/search?q=` | Public | Browser-friendly search |
+| POST | `/ai/ask` | Public | RAG: search + LLM answer |
+| GET | `/documents` | Admin | List all documents |
+| DELETE | `/documents` | Admin | Purge all |
+| GET | `/stats` | Admin | Usage statistics |
 
-## Quick Start
+## Auth
+
+Admin routes require:
+- Header: `X-Search-Admin-Key: search-admin-bervashun-2026`
+- OR: `Authorization: Bearer search-admin-bervashun-2026`
+
+## Examples
 
 ```bash
+BASE="https://ai-search.wwwknockoutforever.com"
+KEY="search-admin-bervashun-2026"
+
+# Health
+curl $BASE/health
+
 # Index a document
-curl -X POST https://ai-search.wwwknockoutforever.com/index \
-  -H "X-Search-Admin-Key: $SEARCH_ADMIN_KEY" \
+curl -X POST $BASE/index \
   -H "Content-Type: application/json" \
-  -d '{
-    "title": "Bervashun Banking Overview",
-    "content": "Bervashun Trust Capital offers modern banking powered by Unit...",
-    "category": "banking"
-  }'
+  -H "X-Search-Admin-Key: $KEY" \
+  -d '[{"id":"doc-1","title":"My Document","content":"...","category":"general"}]'
 
 # Semantic search
-curl "https://ai-search.wwwknockoutforever.com/search?q=how+do+I+open+an+account"
+curl -X POST $BASE/search \
+  -H "Content-Type: application/json" \
+  -d '{"query":"your search query","top_k":5,"threshold":0.5}'
 
-# Ask the AI (RAG)
-curl "https://ai-search.wwwknockoutforever.com/ai/ask?q=what+is+Bervashun"
+# Browser search
+curl "$BASE/search?q=your+query&top_k=5"
+
+# Ask AI (RAG)
+curl -X POST $BASE/ai/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question":"What is ...?","top_k":4}'
+
+# Stats
+curl $BASE/stats -H "X-Search-Admin-Key: $KEY"
 ```
 
 ## Bindings
 
-| Binding | Type | Details |
-|---------|------|---------|
-| `AI` | Workers AI | Embeddings + LLM |
-| `VECTORIZE` | Vectorize | ai-search-index, 768-dim, cosine |
-| `SEARCH_DB` | D1 | bervashun-audit (f2fe6105-...) |
-| `SEARCH_ADMIN_KEY` | Secret | GitHub → CF secret |
+```toml
+[ai]
+binding = "AI"
 
-## GitHub Secrets Required
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "ai-search-index"
 
-- `CF_API_TOKEN` — Cloudflare API token with Workers + D1 + Vectorize permissions
-- `SEARCH_ADMIN_KEY` — Admin key for protected endpoints (choose your own)
+[[d1_databases]]
+binding = "SEARCH_DB"
+database_name = "bervashun-audit"
+database_id = "f2fe6105-b552-42b4-a2ca-9d2a349861da"
+```
