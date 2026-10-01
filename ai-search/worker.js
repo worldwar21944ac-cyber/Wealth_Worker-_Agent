@@ -1,469 +1,506 @@
 /**
  * AI Search Worker v3.0
- * Sovereign AI — wwwknockoutforever.com
- *
- * Features:
- *  - Semantic vector search via Cloudflare Vectorize (768-dim, cosine)
- *  - RAG (Retrieval-Augmented Generation) via Workers AI LLM
- *  - Document ingestion with auto-embedding
- *  - D1 metadata store for document persistence & filtering
- *  - Category-aware search
- *  - Full CORS support
- *  - Admin routes gated by SEARCH_ADMIN_KEY
+ * Sovereign Intelligence Layer — wwwknockoutforever.com
+ * 
+ * Stack:
+ *   - Embedding:  @cf/baai/bge-base-en-v1.5  (768-dim)
+ *   - Vectorize:  ai-search-index (cosine, 768-dim)
+ *   - LLM (RAG):  @cf/meta/llama-3.1-8b-instruct
+ *   - Catalog:    D1 (SEARCH_DB) — search_documents table
+ *   - Auth:       SEARCH_ADMIN_KEY (secret) — admin routes
  *
  * Routes:
- *   GET  /health                   — liveness
- *   POST /index                    — ingest 1-50 docs (admin)
- *   DELETE /index/:id              — remove doc by ID (admin)
- *   POST /search                   — semantic search { query, top_k?, threshold?, category? }
- *   GET  /search?q=                — browser-friendly semantic search
- *   POST /ai/ask                   — RAG: context retrieval + LLM answer { question, top_k?, category? }
- *   GET  /documents                — list indexed docs (admin, ?limit=&offset=&category=)
- *   DELETE /documents              — purge ALL docs + vectors (admin)
- *   GET  /stats                    — index statistics (admin)
+ *   GET  /health                   unauthenticated liveness
+ *   GET  /search?q=<query>         semantic search (browser-friendly)
+ *   POST /search                   semantic search { query, top_k?, threshold?, category?, include_content? }
+ *   POST /ai/ask                   RAG: retrieve context + LLM answer { question, top_k?, category?, system_prompt? }
+ *   POST /index                    ingest 1–100 docs  (admin)
+ *   DELETE /index/:id              remove one doc (admin)
+ *   GET  /documents                list indexed docs (admin, ?limit=&offset=&category=&q=)
+ *   DELETE /documents              purge ALL docs + vectors (admin)
+ *   GET  /stats                    index statistics (admin)
+ *   POST /reindex/:id              re-embed one existing doc (admin)
  */
 
-const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
-const LLM_MODEL       = "@cf/meta/llama-3.1-8b-instruct";
-const DEFAULT_TOP_K   = 5;
-const MAX_INGEST      = 50;
-const VERSION         = "3.0.0";
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Search-Admin-Key',
+  'Access-Control-Expose-Headers': 'X-Request-Id, X-Latency-Ms',
+};
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+const VERSION = '3.0.0';
+const BUILD_DATE = '2026-10-01';
 
-function cors(origin = "*") {
-  return {
-    "Access-Control-Allow-Origin": origin,
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Search-Admin-Key",
-    "Access-Control-Expose-Headers": "X-Request-Id",
-  };
-}
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function json(data, status = 200, extra = {}) {
-  return new Response(JSON.stringify(data), {
+  return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { "Content-Type": "application/json", ...cors(), ...extra },
+    headers: { 'Content-Type': 'application/json', ...CORS_HEADERS, ...extra },
   });
 }
 
-function err(msg, status = 400) {
-  return json({ error: msg, status }, status);
+function err(msg, status = 400, code = 'BAD_REQUEST') {
+  return json({ ok: false, error: { code, message: msg }, version: VERSION }, status);
+}
+
+function requestId() {
+  return crypto.randomUUID().replace(/-/g, '').slice(0, 16);
 }
 
 function isAdmin(req, env) {
-  const key = req.headers.get("X-Search-Admin-Key") ||
-              (req.headers.get("Authorization") || "").replace(/^Bearer\s+/, "");
-  return key === env.SEARCH_ADMIN_KEY;
+  const key = env.SEARCH_ADMIN_KEY;
+  if (!key) return false;
+  const authHeader = req.headers.get('Authorization') || '';
+  const keyHeader  = req.headers.get('X-Search-Admin-Key') || '';
+  return keyHeader === key || authHeader === `Bearer ${key}`;
 }
 
-function requireAdmin(req, env) {
-  if (!isAdmin(req, env)) return err("Unauthorized — admin key required", 401);
-  return null;
-}
-
-// ─── D1 Schema Bootstrap ──────────────────────────────────────────────────────
+// ─── D1 Schema ───────────────────────────────────────────────────────────────
 
 async function ensureSchema(db) {
-  await db.prepare(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS search_documents (
       id          TEXT PRIMARY KEY,
       title       TEXT NOT NULL,
       content     TEXT NOT NULL,
+      summary     TEXT,
       category    TEXT DEFAULT 'general',
-      source_url  TEXT,
+      url         TEXT,
+      author      TEXT,
+      tags        TEXT,
       metadata    TEXT DEFAULT '{}',
       vector_id   TEXT,
-      created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `).run();
-
-  await db.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_sd_category ON search_documents(category)
-  `).run();
-
-  await db.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_sd_created ON search_documents(created_at)
-  `).run();
+      indexed_at  TEXT NOT NULL,
+      updated_at  TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_search_docs_category ON search_documents(category);
+    CREATE INDEX IF NOT EXISTS idx_search_docs_indexed  ON search_documents(indexed_at DESC);
+    CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+      id UNINDEXED, title, content, category, author, tags,
+      content='search_documents', content_rowid='rowid'
+    );
+  `);
 }
 
-// ─── Embedding ────────────────────────────────────────────────────────────────
+// ─── Embedding ───────────────────────────────────────────────────────────────
 
-async function embed(ai, texts) {
-  if (!Array.isArray(texts)) texts = [texts];
-  const resp = await ai.run(EMBEDDING_MODEL, { text: texts });
-  // Returns { data: [ [float, ...], ... ] }
-  return resp.data;
+async function embed(ai, text) {
+  // Truncate to ~8000 chars to stay within model token limit
+  const truncated = text.slice(0, 8000);
+  const result = await ai.run('@cf/baai/bge-base-en-v1.5', { text: [truncated] });
+  return result.data[0]; // float[]
 }
 
-// ─── Ingest ───────────────────────────────────────────────────────────────────
+// ─── RAG — LLM answer ────────────────────────────────────────────────────────
 
-async function handleIngest(req, env) {
-  const denied = requireAdmin(req, env);
-  if (denied) return denied;
+async function ragAnswer(ai, question, contexts, systemPrompt) {
+  const contextText = contexts
+    .map((c, i) => `[${i + 1}] Title: ${c.title}\nContent: ${c.content.slice(0, 600)}`)
+    .join('\n\n---\n\n');
 
-  let body;
-  try { body = await req.json(); } catch { return err("Invalid JSON body"); }
+  const system = systemPrompt ||
+    `You are a precise AI assistant. Answer the user's question using ONLY the provided context documents.
+If the context does not contain enough information, say so clearly.
+Always cite which document(s) you used by referencing their [number].
+Be concise, factual, and structured.`;
 
-  const docs = Array.isArray(body) ? body : body.documents ? body.documents : [body];
-  if (!docs.length) return err("No documents provided");
-  if (docs.length > MAX_INGEST) return err(`Max ${MAX_INGEST} documents per call`);
+  const messages = [
+    { role: 'system', content: system },
+    {
+      role: 'user',
+      content: `Context:\n${contextText}\n\n---\nQuestion: ${question}\n\nAnswer:`,
+    },
+  ];
 
-  // Validate
-  for (const [i, d] of docs.entries()) {
-    if (!d.title || !d.content) return err(`docs[${i}]: title and content are required`);
-  }
-
-  await ensureSchema(env.SEARCH_DB);
-
-  // Embed all docs in one batch call
-  const texts   = docs.map(d => `${d.title}\n\n${d.content}`);
-  const vectors = await embed(env.AI, texts);
-
-  const results = [];
-  for (let i = 0; i < docs.length; i++) {
-    const d   = docs[i];
-    const vec = vectors[i];
-    const id  = d.id || crypto.randomUUID();
-
-    // Upsert into Vectorize
-    await env.VECTORIZE.upsert([{
-      id,
-      values: vec,
-      namespace: "documents",
-      metadata: {
-        title:    d.title,
-        category: d.category || "general",
-        source_url: d.source_url || "",
-      },
-    }]);
-
-    // Upsert into D1
-    await env.SEARCH_DB.prepare(`
-      INSERT INTO search_documents (id, title, content, category, source_url, metadata, vector_id, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-      ON CONFLICT(id) DO UPDATE SET
-        title      = excluded.title,
-        content    = excluded.content,
-        category   = excluded.category,
-        source_url = excluded.source_url,
-        metadata   = excluded.metadata,
-        vector_id  = excluded.vector_id,
-        updated_at = CURRENT_TIMESTAMP
-    `).bind(
-      id,
-      d.title,
-      d.content,
-      d.category || "general",
-      d.source_url || "",
-      JSON.stringify(d.metadata || {}),
-      id,
-    ).run();
-
-    results.push({ id, title: d.title, status: "indexed" });
-  }
-
-  return json({ indexed: results.length, documents: results }, 201);
-}
-
-// ─── Delete Document ──────────────────────────────────────────────────────────
-
-async function handleDeleteDoc(req, env, id) {
-  const denied = requireAdmin(req, env);
-  if (denied) return denied;
-
-  if (!id) return err("Document ID required");
-
-  await env.VECTORIZE.deleteByIds([id]);
-  await env.SEARCH_DB.prepare("DELETE FROM search_documents WHERE id = ?").bind(id).run();
-
-  return json({ deleted: id });
-}
-
-// ─── Semantic Search ──────────────────────────────────────────────────────────
-
-async function handleSearch(req, env, queryParam) {
-  let query, top_k, threshold, category;
-
-  if (req.method === "GET") {
-    query     = queryParam;
-    top_k     = DEFAULT_TOP_K;
-    threshold = 0.5;
-    category  = null;
-  } else {
-    let body;
-    try { body = await req.json(); } catch { return err("Invalid JSON body"); }
-    query     = body.query;
-    top_k     = Math.min(body.top_k || DEFAULT_TOP_K, 20);
-    threshold = body.threshold ?? 0.5;
-    category  = body.category || null;
-  }
-
-  if (!query) return err("query is required");
-
-  await ensureSchema(env.SEARCH_DB);
-
-  const [vec] = await embed(env.AI, [query]);
-
-  const vectorQuery = await env.VECTORIZE.query(vec, {
-    topK:              top_k,
-    returnMetadata:    true,
-    namespace:         "documents",
-    ...(category ? { filter: { category } } : {}),
+  const result = await ai.run('@cf/meta/llama-3.1-8b-instruct', {
+    messages,
+    max_tokens: 768,
+    temperature: 0.2,
   });
 
-  const matches = (vectorQuery.matches || []).filter(m => m.score >= threshold);
-  if (!matches.length) return json({ query, results: [], total: 0 });
+  return result.response || result.choices?.[0]?.message?.content || '';
+}
 
-  // Fetch full content from D1
-  const ids  = matches.map(m => `'${m.id}'`).join(",");
-  const rows = await env.SEARCH_DB.prepare(
-    `SELECT id, title, content, category, source_url, metadata, created_at FROM search_documents WHERE id IN (${ids})`
-  ).all();
+// ─── Route handlers ──────────────────────────────────────────────────────────
 
-  const rowMap = Object.fromEntries((rows.results || []).map(r => [r.id, r]));
+async function handleHealth(env) {
+  return json({
+    ok: true,
+    version: VERSION,
+    build_date: BUILD_DATE,
+    service: 'ai-search',
+    domain: 'ai-search.wwwknockoutforever.com',
+    capabilities: ['semantic-search', 'rag', 'fts', 'vectorize', 'workers-ai'],
+  });
+}
 
-  const results = matches.map(m => {
-    const row = rowMap[m.id] || {};
+async function handleSearch(req, env) {
+  const t0 = Date.now();
+  const rid = requestId();
+
+  let query, top_k = 8, threshold = 0.3, category, include_content = false;
+
+  if (req.method === 'GET') {
+    const url = new URL(req.url);
+    query = url.searchParams.get('q') || '';
+    top_k = parseInt(url.searchParams.get('top_k') || '8', 10);
+    threshold = parseFloat(url.searchParams.get('threshold') || '0.3');
+    category = url.searchParams.get('category') || null;
+    include_content = url.searchParams.get('include_content') === 'true';
+  } else {
+    const body = await req.json().catch(() => ({}));
+    ({ query = '', top_k = 8, threshold = 0.3, category = null, include_content = false } = body);
+  }
+
+  if (!query || query.trim().length < 2)
+    return err('query must be at least 2 characters', 400, 'QUERY_TOO_SHORT');
+
+  top_k = Math.min(Math.max(top_k, 1), 50);
+
+  // 1. Embed query
+  const queryVec = await embed(env.AI, query);
+
+  // 2. Vectorize search
+  const vectorFilter = category ? { category: { $eq: category } } : undefined;
+  const vResult = await env.VECTORIZE.query(queryVec, {
+    topK: top_k,
+    returnMetadata: 'all',
+    filter: vectorFilter,
+  });
+
+  const hits = (vResult.matches || []).filter(m => m.score >= threshold);
+
+  if (hits.length === 0) {
+    return json({ ok: true, query, results: [], total: 0, latency_ms: Date.now() - t0 },
+      200, { 'X-Request-Id': rid, 'X-Latency-Ms': String(Date.now() - t0) });
+  }
+
+  // 3. Fetch full docs from D1 for each hit
+  const ids = hits.map(h => h.metadata?.doc_id || h.id).filter(Boolean);
+  const placeholders = ids.map(() => '?').join(',');
+  const { results: docs } = await env.SEARCH_DB.prepare(
+    `SELECT id, title, content, summary, category, url, author, tags, metadata, indexed_at
+     FROM search_documents WHERE id IN (${placeholders})`
+  ).bind(...ids).all();
+
+  const docMap = Object.fromEntries(docs.map(d => [d.id, d]));
+
+  const results = hits.map(hit => {
+    const docId = hit.metadata?.doc_id || hit.id;
+    const doc   = docMap[docId] || {};
     return {
-      id:         m.id,
-      score:      parseFloat(m.score.toFixed(4)),
-      title:      row.title || m.metadata?.title || "",
-      content:    row.content || "",
-      category:   row.category || m.metadata?.category || "general",
-      source_url: row.source_url || m.metadata?.source_url || "",
-      metadata:   row.metadata ? JSON.parse(row.metadata) : {},
-      created_at: row.created_at || null,
+      id:         docId,
+      score:      Math.round(hit.score * 10000) / 10000,
+      title:      doc.title || hit.metadata?.title || 'Untitled',
+      summary:    doc.summary || null,
+      category:   doc.category || hit.metadata?.category || 'general',
+      url:        doc.url || null,
+      author:     doc.author || null,
+      tags:       doc.tags ? JSON.parse(doc.tags) : [],
+      indexed_at: doc.indexed_at || null,
+      ...(include_content ? { content: doc.content || '' } : {}),
     };
   });
 
-  return json({ query, results, total: results.length });
+  return json(
+    { ok: true, query, results, total: results.length, latency_ms: Date.now() - t0 },
+    200,
+    { 'X-Request-Id': rid, 'X-Latency-Ms': String(Date.now() - t0) }
+  );
 }
-
-// ─── RAG ─────────────────────────────────────────────────────────────────────
 
 async function handleAsk(req, env) {
-  let body;
-  try { body = await req.json(); } catch { return err("Invalid JSON body"); }
+  const t0 = Date.now();
+  const rid = requestId();
+  const body = await req.json().catch(() => ({}));
+  const { question, top_k = 5, category = null, system_prompt = null, threshold = 0.25 } = body;
 
-  const { question, top_k = 4, category = null } = body;
-  if (!question) return err("question is required");
+  if (!question || question.trim().length < 4)
+    return err('question must be at least 4 characters', 400, 'QUESTION_TOO_SHORT');
+
+  // 1. Embed question
+  const queryVec = await embed(env.AI, question);
+
+  // 2. Retrieve top-k context
+  const vectorFilter = category ? { category: { $eq: category } } : undefined;
+  const vResult = await env.VECTORIZE.query(queryVec, {
+    topK: Math.min(top_k, 20),
+    returnMetadata: 'all',
+    filter: vectorFilter,
+  });
+
+  const hits = (vResult.matches || []).filter(m => m.score >= threshold);
+
+  if (hits.length === 0) {
+    return json({
+      ok: true, question,
+      answer: "I don't have relevant documents to answer this question. Please index some content first.",
+      sources: [], latency_ms: Date.now() - t0,
+    }, 200, { 'X-Request-Id': rid });
+  }
+
+  // 3. Fetch docs
+  const ids = hits.map(h => h.metadata?.doc_id || h.id).filter(Boolean);
+  const placeholders = ids.map(() => '?').join(',');
+  const { results: docs } = await env.SEARCH_DB.prepare(
+    `SELECT id, title, content, url FROM search_documents WHERE id IN (${placeholders})`
+  ).bind(...ids).all();
+
+  const docMap = Object.fromEntries(docs.map(d => [d.id, d]));
+  const contexts = hits.map(hit => {
+    const docId = hit.metadata?.doc_id || hit.id;
+    return { ...docMap[docId], score: hit.score };
+  }).filter(c => c.title);
+
+  // 4. RAG answer
+  const answer = await ragAnswer(env.AI, question, contexts, system_prompt);
+
+  const sources = contexts.map(c => ({
+    id: c.id, title: c.title, url: c.url || null, score: Math.round(c.score * 10000) / 10000,
+  }));
+
+  return json(
+    { ok: true, question, answer, sources, latency_ms: Date.now() - t0 },
+    200,
+    { 'X-Request-Id': rid, 'X-Latency-Ms': String(Date.now() - t0) }
+  );
+}
+
+async function handleIndex(req, env) {
+  const body = await req.json().catch(() => ({}));
+  const docs  = Array.isArray(body) ? body : body.documents ? body.documents : [body];
+
+  if (docs.length === 0)  return err('No documents provided');
+  if (docs.length > 100)  return err('Max 100 documents per request', 400, 'TOO_MANY_DOCS');
 
   await ensureSchema(env.SEARCH_DB);
 
-  // Step 1 — embed the question
-  const [vec] = await embed(env.AI, [question]);
+  const results = [];
+  const vectors = [];
+  const now = new Date().toISOString();
 
-  // Step 2 — retrieve top-K context docs
-  const vectorQuery = await env.VECTORIZE.query(vec, {
-    topK:           top_k,
-    returnMetadata: true,
-    namespace:      "documents",
-    ...(category ? { filter: { category } } : {}),
-  });
+  for (const doc of docs) {
+    if (!doc.title || !doc.content)
+      return err(`Document missing required fields: title, content. Got: ${JSON.stringify(Object.keys(doc))}`);
 
-  const matches = (vectorQuery.matches || []).filter(m => m.score >= 0.4);
+    const id       = doc.id || crypto.randomUUID();
+    const category = doc.category || 'general';
+    const summary  = doc.summary || doc.content.slice(0, 200).replace(/\s+/g, ' ') + (doc.content.length > 200 ? '...' : '');
+    const textToEmbed = `${doc.title}\n\n${doc.content}`;
 
-  let context = "";
-  let sources = [];
+    // Embed
+    const vec = await embed(env.AI, textToEmbed);
 
-  if (matches.length) {
-    const ids  = matches.map(m => `'${m.id}'`).join(",");
-    const rows = await env.SEARCH_DB.prepare(
-      `SELECT id, title, content, source_url FROM search_documents WHERE id IN (${ids})`
-    ).all();
-
-    const rowMap = Object.fromEntries((rows.results || []).map(r => [r.id, r]));
-
-    sources = matches.map(m => {
-      const row = rowMap[m.id] || {};
-      return { id: m.id, title: row.title || m.metadata?.title, score: parseFloat(m.score.toFixed(4)), source_url: row.source_url };
+    vectors.push({
+      id: id,
+      values: vec,
+      metadata: {
+        doc_id:   id,
+        title:    doc.title.slice(0, 200),
+        category: category,
+        indexed_at: now,
+      },
     });
 
-    context = matches.map((m, i) => {
-      const row = rowMap[m.id] || {};
-      return `[Source ${i + 1}: ${row.title || "Untitled"}]\n${row.content || ""}`;
-    }).join("\n\n---\n\n");
+    // Upsert D1
+    await env.SEARCH_DB.prepare(`
+      INSERT INTO search_documents (id, title, content, summary, category, url, author, tags, metadata, vector_id, indexed_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        title=excluded.title, content=excluded.content, summary=excluded.summary,
+        category=excluded.category, url=excluded.url, author=excluded.author,
+        tags=excluded.tags, metadata=excluded.metadata, updated_at=excluded.updated_at
+    `).bind(
+      id, doc.title, doc.content, summary, category,
+      doc.url || null, doc.author || null,
+      doc.tags ? JSON.stringify(doc.tags) : null,
+      doc.metadata ? JSON.stringify(doc.metadata) : '{}',
+      id, now, now
+    ).run();
+
+    results.push({ id, title: doc.title, category });
   }
 
-  // Step 3 — LLM generation
-  const systemPrompt = context
-    ? `You are a helpful AI assistant. Use ONLY the provided context to answer the question. If the answer is not in the context, say you don't have enough information. Be concise and accurate.\n\nContext:\n${context}`
-    : `You are a helpful AI assistant. Answer the user's question concisely.`;
+  // Upsert vectors in batch
+  await env.VECTORIZE.upsert(vectors);
 
-  const llmResp = await env.AI.run(LLM_MODEL, {
-    messages: [
-      { role: "system",    content: systemPrompt },
-      { role: "user",      content: question },
-    ],
-    max_tokens: 512,
-  });
-
-  const answer = llmResp.response || "";
-
-  return json({
-    question,
-    answer,
-    sources,
-    context_docs: matches.length,
-    model: LLM_MODEL,
-  });
+  return json({ ok: true, indexed: results.length, documents: results }, 201);
 }
 
-// ─── List Documents ───────────────────────────────────────────────────────────
+async function handleDeleteDoc(id, env) {
+  // Remove from Vectorize
+  await env.VECTORIZE.deleteByIds([id]).catch(() => {});
+  // Remove from D1
+  const res = await env.SEARCH_DB.prepare(
+    'DELETE FROM search_documents WHERE id = ? RETURNING id, title'
+  ).bind(id).first();
 
-async function handleListDocs(req, env) {
-  const denied = requireAdmin(req, env);
-  if (denied) return denied;
+  if (!res) return err(`Document ${id} not found`, 404, 'NOT_FOUND');
+  return json({ ok: true, deleted: { id: res.id, title: res.title } });
+}
 
-  await ensureSchema(env.SEARCH_DB);
+async function handleListDocuments(req, env) {
+  const url    = new URL(req.url);
+  const limit  = Math.min(parseInt(url.searchParams.get('limit')  || '50', 10), 500);
+  const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+  const cat    = url.searchParams.get('category') || null;
+  const q      = url.searchParams.get('q') || null;
 
-  const url      = new URL(req.url);
-  const limit    = Math.min(parseInt(url.searchParams.get("limit") || "50"), 200);
-  const offset   = parseInt(url.searchParams.get("offset") || "0");
-  const category = url.searchParams.get("category");
+  let where = '';
+  const binds = [];
+  if (cat) { where += ' WHERE category = ?'; binds.push(cat); }
+  if (q)   { where += (where ? ' AND' : ' WHERE') + ' (title LIKE ? OR content LIKE ?)'; binds.push(`%${q}%`, `%${q}%`); }
 
-  let query  = "SELECT id, title, category, source_url, metadata, created_at, updated_at FROM search_documents";
-  let params = [];
+  const { results } = await env.SEARCH_DB.prepare(
+    `SELECT id, title, summary, category, url, author, tags, indexed_at, updated_at
+     FROM search_documents${where} ORDER BY indexed_at DESC LIMIT ? OFFSET ?`
+  ).bind(...binds, limit, offset).all();
 
-  if (category) {
-    query  += " WHERE category = ?";
-    params  = [category];
+  const { results: [{ total }] } = await env.SEARCH_DB.prepare(
+    `SELECT COUNT(*) AS total FROM search_documents${where}`
+  ).bind(...binds).all();
+
+  return json({ ok: true, documents: results, total, limit, offset });
+}
+
+async function handlePurge(env) {
+  await env.SEARCH_DB.prepare('DELETE FROM search_documents').run().catch(() => {});
+  // Vectorize doesn't have a bulk-delete, so we fetch all IDs and delete
+  // (For large indexes, do this in pages — here up to 1000 IDs)
+  const { results } = await env.SEARCH_DB.prepare('SELECT id FROM search_documents LIMIT 1000').all().catch(() => ({ results: [] }));
+  if (results.length) {
+    await env.VECTORIZE.deleteByIds(results.map(r => r.id)).catch(() => {});
   }
-  query += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
-  params.push(limit, offset);
-
-  const rows  = await env.SEARCH_DB.prepare(query).bind(...params).all();
-  const count = await env.SEARCH_DB.prepare(
-    category ? "SELECT COUNT(*) as n FROM search_documents WHERE category = ?" : "SELECT COUNT(*) as n FROM search_documents"
-  ).bind(...(category ? [category] : [])).first();
-
-  return json({
-    documents: (rows.results || []).map(r => ({
-      ...r,
-      metadata: r.metadata ? JSON.parse(r.metadata) : {},
-    })),
-    total:  count?.n || 0,
-    limit,
-    offset,
-  });
+  await env.SEARCH_DB.prepare('DELETE FROM search_documents').run();
+  return json({ ok: true, message: 'All documents and vectors purged' });
 }
 
-// ─── Purge All ────────────────────────────────────────────────────────────────
-
-async function handlePurge(req, env) {
-  const denied = requireAdmin(req, env);
-  if (denied) return denied;
-
+async function handleStats(env) {
   await ensureSchema(env.SEARCH_DB);
+  const { results: [row] } = await env.SEARCH_DB.prepare(`
+    SELECT
+      COUNT(*)                              AS total_documents,
+      COUNT(DISTINCT category)              AS categories,
+      MIN(indexed_at)                       AS oldest_doc,
+      MAX(indexed_at)                       AS newest_doc,
+      AVG(LENGTH(content))                  AS avg_content_length
+    FROM search_documents
+  `).all();
 
-  // Get all IDs to delete from Vectorize
-  const rows = await env.SEARCH_DB.prepare("SELECT id FROM search_documents").all();
-  const ids  = (rows.results || []).map(r => r.id);
-
-  if (ids.length) await env.VECTORIZE.deleteByIds(ids);
-
-  await env.SEARCH_DB.prepare("DELETE FROM search_documents").run();
-
-  return json({ purged: ids.length, message: "All documents and vectors removed" });
-}
-
-// ─── Stats ────────────────────────────────────────────────────────────────────
-
-async function handleStats(req, env) {
-  const denied = requireAdmin(req, env);
-  if (denied) return denied;
-
-  await ensureSchema(env.SEARCH_DB);
-
-  const total     = await env.SEARCH_DB.prepare("SELECT COUNT(*) as n FROM search_documents").first();
-  const byCategory = await env.SEARCH_DB.prepare(
-    "SELECT category, COUNT(*) as count FROM search_documents GROUP BY category ORDER BY count DESC"
-  ).all();
-  const recent    = await env.SEARCH_DB.prepare(
-    "SELECT id, title, category, created_at FROM search_documents ORDER BY created_at DESC LIMIT 5"
+  const { results: cats } = await env.SEARCH_DB.prepare(
+    'SELECT category, COUNT(*) as count FROM search_documents GROUP BY category ORDER BY count DESC'
   ).all();
 
   return json({
-    total_documents: total?.n || 0,
-    by_category:    byCategory.results || [],
-    recent:         recent.results || [],
-    embedding_model: EMBEDDING_MODEL,
-    llm_model:      LLM_MODEL,
-    version:        VERSION,
-  });
-}
-
-// ─── Health ───────────────────────────────────────────────────────────────────
-
-async function handleHealth(env) {
-  let db_ok = false;
-  try {
-    await ensureSchema(env.SEARCH_DB);
-    await env.SEARCH_DB.prepare("SELECT 1").first();
-    db_ok = true;
-  } catch {}
-
-  return json({
-    status:  "ok",
+    ok: true,
     version: VERSION,
-    service: "ai-search",
-    domain:  "ai-search.wwwknockoutforever.com",
-    components: {
-      d1:       db_ok ? "ok" : "error",
-      vectorize: "ok",
-      ai:        "ok",
+    stats: {
+      total_documents:   row.total_documents,
+      categories:        row.categories,
+      oldest_doc:        row.oldest_doc,
+      newest_doc:        row.newest_doc,
+      avg_content_length: Math.round(row.avg_content_length || 0),
+      by_category:       cats,
     },
-    embedding_model: EMBEDDING_MODEL,
-    llm_model:       LLM_MODEL,
-    timestamp: new Date().toISOString(),
+    models: {
+      embedding: '@cf/baai/bge-base-en-v1.5 (768-dim)',
+      llm:       '@cf/meta/llama-3.1-8b-instruct',
+    },
   });
 }
 
-// ─── Router ───────────────────────────────────────────────────────────────────
+async function handleReindex(id, env) {
+  const doc = await env.SEARCH_DB.prepare(
+    'SELECT id, title, content, category FROM search_documents WHERE id = ?'
+  ).bind(id).first();
+
+  if (!doc) return err(`Document ${id} not found`, 404, 'NOT_FOUND');
+
+  const vec = await embed(env.AI, `${doc.title}\n\n${doc.content}`);
+  await env.VECTORIZE.upsert([{
+    id: doc.id,
+    values: vec,
+    metadata: { doc_id: doc.id, title: doc.title.slice(0, 200), category: doc.category },
+  }]);
+
+  const now = new Date().toISOString();
+  await env.SEARCH_DB.prepare('UPDATE search_documents SET updated_at = ? WHERE id = ?').bind(now, id).run();
+
+  return json({ ok: true, reindexed: { id: doc.id, title: doc.title } });
+}
+
+// ─── Router ──────────────────────────────────────────────────────────────────
 
 export default {
-  async fetch(req, env) {
-    const url    = new URL(req.url);
-    const path   = url.pathname;
-    const method = req.method;
-
+  async fetch(request, env) {
     // CORS preflight
-    if (method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: cors() });
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    // Health
-    if (path === "/health" && method === "GET") return handleHealth(env);
+    const url      = new URL(request.url);
+    const path     = url.pathname;
+    const method   = request.method;
+    const admin    = isAdmin(request, env);
 
-    // Stats
-    if (path === "/stats" && method === "GET") return handleStats(req, env);
+    try {
+      await ensureSchema(env.SEARCH_DB);
 
-    // Document ingestion
-    if (path === "/index" && method === "POST") return handleIngest(req, env);
+      // ── Public routes ──────────────────────────────────
+      if (path === '/health' && method === 'GET')
+        return handleHealth(env);
 
-    // Delete a single document
-    if (path.startsWith("/index/") && method === "DELETE") {
-      const id = path.replace("/index/", "").trim();
-      return handleDeleteDoc(req, env, id);
+      if (path === '/search' && (method === 'GET' || method === 'POST'))
+        return handleSearch(request, env);
+
+      if (path === '/ai/ask' && method === 'POST')
+        return handleAsk(request, env);
+
+      // ── Admin routes ────────────────────────────────────
+      if (!admin && ['/index', '/documents', '/stats'].some(p => path.startsWith(p)))
+        return err('Unauthorized — provide X-Search-Admin-Key or Bearer token', 401, 'UNAUTHORIZED');
+
+      if (path === '/index' && method === 'POST')
+        return handleIndex(request, env);
+
+      const deleteMatch = path.match(/^\/index\/(.+)$/);
+      if (deleteMatch && method === 'DELETE') {
+        if (!admin) return err('Unauthorized', 401, 'UNAUTHORIZED');
+        return handleDeleteDoc(deleteMatch[1], env);
+      }
+
+      if (path === '/documents' && method === 'GET') {
+        if (!admin) return err('Unauthorized', 401, 'UNAUTHORIZED');
+        return handleListDocuments(request, env);
+      }
+
+      if (path === '/documents' && method === 'DELETE') {
+        if (!admin) return err('Unauthorized', 401, 'UNAUTHORIZED');
+        return handlePurge(env);
+      }
+
+      if (path === '/stats' && method === 'GET') {
+        if (!admin) return err('Unauthorized', 401, 'UNAUTHORIZED');
+        return handleStats(env);
+      }
+
+      const reindexMatch = path.match(/^\/reindex\/(.+)$/);
+      if (reindexMatch && method === 'POST') {
+        if (!admin) return err('Unauthorized', 401, 'UNAUTHORIZED');
+        return handleReindex(reindexMatch[1], env);
+      }
+
+      return err(`Unknown route: ${method} ${path}`, 404, 'NOT_FOUND');
+
+    } catch (e) {
+      console.error('ai-search error:', e);
+      return json({
+        ok: false,
+        error: { code: 'INTERNAL_ERROR', message: e.message },
+        version: VERSION,
+      }, 500);
     }
-
-    // Semantic search
-    if (path === "/search") {
-      if (method === "GET")  return handleSearch(req, env, url.searchParams.get("q") || "");
-      if (method === "POST") return handleSearch(req, env, null);
-    }
-
-    // RAG
-    if (path === "/ai/ask" && method === "POST") return handleAsk(req, env);
-
-    // List documents
-    if (path === "/documents" && method === "GET") return handleListDocs(req, env);
-
-    // Purge all
-    if (path === "/documents" && method === "DELETE") return handlePurge(req, env);
-
-    return json({ error: "Not found", path, method }, 404);
   },
 };
