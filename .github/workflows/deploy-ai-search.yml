@@ -1,4 +1,4 @@
-name: Deploy AI Search Worker
+name: Deploy AI Search Worker v3.0
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    name: Deploy ai-search to Cloudflare Workers
+    name: Deploy ai-search v3.0 to Cloudflare Workers
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,7 +31,9 @@ jobs:
           wrangler vectorize create ai-search-index \
             --dimensions=768 \
             --metric=cosine \
-            2>&1 || echo "Index may already exist — continuing"
+            2>&1 | tee /tmp/vectorize.log || true
+          cat /tmp/vectorize.log
+          echo "✅ Vectorize step done (existing index is fine)"
         env:
           CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: fd6f05d3bbca4cc5f175ca4f7154552b
@@ -39,7 +41,7 @@ jobs:
       # ── Deploy worker ────────────────────────────────────────────────────
       - name: Deploy Worker
         working-directory: ai-search
-        run: wrangler deploy
+        run: wrangler deploy --no-bundle
         env:
           CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: fd6f05d3bbca4cc5f175ca4f7154552b
@@ -54,21 +56,21 @@ jobs:
           CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: fd6f05d3bbca4cc5f175ca4f7154552b
 
-      # ── Add custom domain ────────────────────────────────────────────────
+      # ── Add custom domain (idempotent) ───────────────────────────────────
       - name: Add Custom Domain (ai-search.wwwknockoutforever.com)
         run: |
-          curl -s -X POST \
-            "https://api.cloudflare.com/client/v4/accounts/fd6f05d3bbca4cc5f175ca4f7154552b/workers/scripts/ai-search/domains" \
+          curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/fd6f05d3bbca4cc5f175ca4f7154552b/workers/domains" \
             -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d '{"hostname":"ai-search.wwwknockoutforever.com","zone_id":"525461af7dfa6b8bbe5f8f7d465602a0"}' \
+            -d '{"hostname":"ai-search.wwwknockoutforever.com","service":"ai-search","environment":"production","zone_id":"525461af7dfa6b8bbe5f8f7d465602a0"}' \
             | python3 -c "import sys,json; r=json.load(sys.stdin); print('Domain:', r.get('result',{}).get('hostname','?'), '| success:', r.get('success'))" \
-            2>&1 || echo "Domain may already be configured"
+            2>&1
 
       # ── Health check ─────────────────────────────────────────────────────
       - name: Health check (post-deploy)
         run: |
-          sleep 8
+          sleep 10
           curl -sf https://ai-search.wwwknockoutforever.com/health \
-            && echo " ✅ AI Search is live" \
+            && echo "✅ AI Search v3.0 is live" \
             || echo "⚠️  Health check pending (DNS propagation may take a moment)"
