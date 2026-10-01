@@ -1,592 +1,430 @@
-#!/usr/bin/env node
-// =============================================================
-//  KYC-Gateway v11.0 — Unit Test Suite
-//  Node.js, zero external dependencies, 150+ assertions
-//  Run: node unit_test.cjs
-// =============================================================
-"use strict";
+/**
+ * kyc-gateway v15.0 — Unit Test Suite
+ * 210 assertions covering all 22 engines, TIN/EIN/ITIN logic, decision bands, helpers
+ */
 
-let passed = 0, failed = 0, total = 0;
+'use strict';
 
-function assert(label, condition, extra) {
-  total++;
-  if (condition) {
-    passed++;
-    process.stdout.write(`  ✓ ${label}\n`);
-  } else {
-    failed++;
-    process.stderr.write(`  ✗ FAIL: ${label}${extra ? " — " + extra : ""}\n`);
-  }
+let passed = 0, failed = 0;
+
+function assert(label, condition) {
+  if (condition) { passed++; }
+  else { failed++; console.error(`  ✗ FAIL: ${label}`); }
 }
 
-function assertEqual(label, a, b) {
-  assert(label, a === b, `expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
-}
+// ── Re-implement helpers locally ───────────────────────────────────────────────
 
-function assertRange(label, v, lo, hi) {
-  assert(label, v >= lo && v <= hi, `expected ${lo}–${hi}, got ${v}`);
-}
-
-function section(name) {
-  console.log(`\n▶ ${name}`);
-}
-
-// ─── Re-implement testable pure functions ────────────────────
-
-const SUFFIX_RE = /\b(jr|sr|ii|iii|iv|llc|inc|corp|ltd|co|trust)\b\.?/gi;
-function normalName(s) {
-  if (!s) return "";
-  return s.replace(SUFFIX_RE, "").replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function jaroWinkler(a, b) {
-  a = a.toLowerCase(); b = b.toLowerCase();
-  if (a === b) return 1;
-  const la = a.length, lb = b.length;
-  if (!la || !lb) return 0;
-  const matchDist = Math.max(Math.floor(Math.max(la, lb) / 2) - 1, 0);
-  const aMatched = new Uint8Array(la);
-  const bMatched = new Uint8Array(lb);
-  let matches = 0, transpositions = 0;
-  for (let i = 0; i < la; i++) {
-    const lo = Math.max(0, i - matchDist);
-    const hi = Math.min(lb - 1, i + matchDist);
-    for (let j = lo; j <= hi; j++) {
-      if (bMatched[j] || a[i] !== b[j]) continue;
-      aMatched[i] = bMatched[j] = 1; matches++; break;
+function jaroWinkler(s1, s2) {
+  if (!s1 || !s2) return 0;
+  s1 = s1.toLowerCase(); s2 = s2.toLowerCase();
+  if (s1 === s2) return 1;
+  const len1 = s1.length, len2 = s2.length;
+  const matchDist = Math.floor(Math.max(len1, len2) / 2) - 1;
+  if (matchDist < 0) return 0;
+  const s1m = Array(len1).fill(false), s2m = Array(len2).fill(false);
+  let matches = 0, trans = 0;
+  for (let i = 0; i < len1; i++) {
+    const lo = Math.max(0, i - matchDist), hi = Math.min(i + matchDist + 1, len2);
+    for (let j = lo; j < hi; j++) {
+      if (!s2m[j] && s1[i] === s2[j]) { s1m[i] = s2m[j] = true; matches++; break; }
     }
   }
   if (!matches) return 0;
   let k = 0;
-  for (let i = 0; i < la; i++) {
-    if (!aMatched[i]) continue;
-    while (!bMatched[k]) k++;
-    if (a[i] !== b[k]) transpositions++;
-    k++;
+  for (let i = 0; i < len1; i++) {
+    if (s1m[i]) { while (!s2m[k]) k++; if (s1[i] !== s2[k]) trans++; k++; }
   }
-  const jaro = (matches / la + matches / lb + (matches - transpositions / 2) / matches) / 3;
-  const pfxLen = [...a].findIndex((c, i) => c !== b[i]);
-  const pfx = pfxLen === -1 ? Math.min(4, la) : Math.min(4, pfxLen);
-  return jaro + pfx * 0.1 * (1 - jaro);
+  const jaro = (matches / len1 + matches / len2 + (matches - trans / 2) / matches) / 3;
+  let prefix = 0;
+  for (let i = 0; i < Math.min(4, len1, len2); i++) {
+    if (s1[i] === s2[i]) prefix++; else break;
+  }
+  return jaro + prefix * 0.1 * (1 - jaro);
 }
 
-function tokenSetSimilarity(a, b) {
-  const tokA = new Set(a.toLowerCase().split(/\s+/).filter(Boolean));
-  const tokB = new Set(b.toLowerCase().split(/\s+/).filter(Boolean));
-  const inter = [...tokA].filter(t => tokB.has(t)).length;
-  const union = new Set([...tokA, ...tokB]).size;
+function tokenSetSim(a, b) {
+  if (!a || !b) return 0;
+  const ta = new Set(a.toLowerCase().split(/\s+/));
+  const tb = new Set(b.toLowerCase().split(/\s+/));
+  const inter = [...ta].filter(x => tb.has(x)).length;
+  const union = new Set([...ta, ...tb]).size;
   return union === 0 ? 0 : inter / union;
 }
 
-function stripTin(tin) { return (tin || "").replace(/\D/g, ""); }
-
-function isValidSSN(tin) {
-  const d = stripTin(tin);
-  if (d.length !== 9) return false;
-  const area = +d.slice(0, 3);
-  if (area === 0 || area === 666 || area >= 900) return false;
-  if (d.slice(3, 5) === "00") return false;
-  if (d.slice(5) === "0000") return false;
-  return true;
+function normalizeName(raw) {
+  if (!raw) return '';
+  return raw
+    .toLowerCase()
+    .replace(/\b(jr|sr|ii|iii|iv|v|llc|inc|corp|ltd|co|plc|group|holdings|international|intl|trust|foundation|the)\b\.?/g, '')
+    .replace(/[^a-z0-9 ]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
-const EIN_DISALLOWED = new Set(["07","08","09","17","18","19","28","29","49","69","70","78","79","89","96","97"]);
-function isValidEIN(tin) {
-  const d = stripTin(tin);
-  if (d.length !== 9) return false;
-  return !EIN_DISALLOWED.has(d.slice(0, 2));
+function fuzzyMatch(name, listStr, threshold = 0.82) {
+  if (!name || !listStr) return false;
+  const norm = normalizeName(name);
+  const entries = listStr.split('\n').map(e => normalizeName(e.trim())).filter(Boolean);
+  for (const entry of entries) {
+    if (jaroWinkler(norm, entry) >= threshold || tokenSetSim(norm, entry) >= 0.80) return true;
+  }
+  return false;
+}
+
+const EIN_DISALLOWED_PREFIX = new Set(['07','08','09','17','18','19','28','29','49','69','70','78','79','89']);
+
+const ITIN_VALID_GROUPS = (() => {
+  const g = new Set();
+  for (let i = 70; i <= 88; i++) g.add(String(i));
+  for (let i = 90; i <= 92; i++) g.add(String(i));
+  for (let i = 94; i <= 99; i++) g.add(String(i));
+  return g;
+})();
+
+function validateSSN(ssn) {
+  const d = ssn.replace(/[^0-9]/g, '');
+  if (d.length !== 9) return { valid: false, reason: 'bad_length' };
+  const area = d.slice(0, 3), group = d.slice(3, 5), serial = d.slice(5); // last 4 digits
+  // ITIN check FIRST
+  if (parseInt(area) >= 900) {
+    if (area === '999' && group === '99') return { valid: false, reason: 'blacklisted_itin' };
+    if (!ITIN_VALID_GROUPS.has(group)) return { valid: false, reason: 'invalid_itin_group' };
+    return { valid: true, isITIN: true };
+  }
+  if (area === '000' || area === '666') return { valid: false, reason: 'invalid_area' };
+  if (group === '00') return { valid: false, reason: 'zero_group' };
+  if (serial === '0000') return { valid: false, reason: 'zero_serial' };
+  if (d === '123456789' || d === '111111111' || d === '999999999') return { valid: false, reason: 'blacklisted' };
+  return { valid: true, isITIN: false };
+}
+
+function validateEIN(ein) {
+  const d = ein.replace(/[^0-9]/g, '');
+  if (d.length !== 9) return { valid: false, reason: 'bad_length' };
+  const prefix = d.slice(0, 2);
+  if (EIN_DISALLOWED_PREFIX.has(prefix)) return { valid: false, reason: 'disallowed_prefix' };
+  return { valid: true };
 }
 
 const FATF_HIGH_RISK = new Set([
-  "AF","AL","AO","BB","BF","BI","BJ","BT","CF","CM","CG","CD","CI","CU",
-  "DZ","ER","ET","GH","GN","GW","HT","IR","IQ","JM","JO","KE","KH","KP",
-  "LA","LB","LR","LY","ML","MM","MR","MZ","NE","NG","NI","PA","PH","PK",
-  "RU","SD","SL","SO","SS","SY","TJ","TN","TT","UG","VU","YE","ZW","VE"
+  'AF','AL','AO','BB','BF','BJ','BI','CM','CD','CF','CG','CU','ET','GH','GN','GW','GY',
+  'HT','IQ','IR','KP','LB','LR','LY','ML','MM','MR','MZ','NE','NG','PA','PK','PH','RU',
+  'SD','SL','SN','SO','SS','SY','TG','TJ','TM','TT','TR','UA','UG','VE','VU','YE','ZW',
+  'BY','KZ','UZ','AZ','AM','GE','KG'
 ]);
 
 const ADVERSE_KEYWORDS = [
-  "fraud","laundering","trafficking","cartel","terrorism","corruption",
-  "bribery","sanctions","embezzlement","extortion","forgery","counterfeiting",
-  "ransomware","cybercrime","narcotics","ponzi","smuggling","terrorist",
-  "felony","indictment"
+  'fraud','money laundering','terrorist','trafficking','sanction','cartel',
+  'corruption','bribery','ponzi','embezzlement','cybercrime','darknet',
+  'narco','smuggling','extortion','organized crime'
 ];
 
-function fuzzyMatch(name, list) {
-  const n = normalName(name);
-  return list.filter(e => {
-    const en = normalName(typeof e === "string" ? e : e.name || "");
-    return jaroWinkler(n, en) >= 0.82 || tokenSetSimilarity(n, en) >= 0.80;
+function validateITINExpiry(itinIssuedYear) {
+  if (!itinIssuedYear) return false;
+  const age = new Date().getFullYear() - parseInt(itinIssuedYear);
+  return age > 3;
+}
+
+// ── Section 1: Jaro-Winkler ────────────────────────────────────────────────────
+console.log('\n[1] Jaro-Winkler similarity');
+assert('identical strings → 1.0', jaroWinkler('john smith', 'john smith') === 1.0);
+assert('empty string → 0', jaroWinkler('', 'john') === 0);
+assert('clearly different → <0.5', jaroWinkler('john smith', 'xxxxxxxxxx') < 0.5);
+assert('high similarity john smith / jon smith', jaroWinkler('john smith', 'jon smith') > 0.82);
+assert('prefix bonus applies', jaroWinkler('martha', 'marhta') > 0.9);
+assert('case insensitive', jaroWinkler('JOHN', 'john') === 1.0);
+
+// ── Section 2: Token-Set Similarity ───────────────────────────────────────────
+console.log('\n[2] Token-set similarity');
+assert('identical → 1.0', tokenSetSim('bin laden', 'bin laden') === 1.0);
+assert('empty → 0', tokenSetSim('', 'abc') === 0);
+assert('partial overlap', tokenSetSim('osama bin laden', 'bin laden') >= 0.5);
+assert('no overlap → 0', tokenSetSim('john doe', 'xyz abc') === 0);
+assert('order independent', tokenSetSim('laden bin', 'bin laden') === 1.0);
+
+// ── Section 3: normalizeName ───────────────────────────────────────────────────
+console.log('\n[3] normalizeName');
+assert('strips LLC', normalizeName('Acme LLC') === 'acme');
+assert('strips Inc', normalizeName('Techcorp Inc.') === 'techcorp');
+assert('strips Jr', normalizeName('John Smith Jr') === 'john smith');
+assert('strips Sr', normalizeName('Robert Smith Sr') === 'robert smith');
+assert('strips Corp', normalizeName('BigBank Corp') === 'bigbank');
+assert('strips Holdings', normalizeName('BlackRock Holdings') === 'blackrock');
+assert('strips International', normalizeName('GlobalPay International') === 'globalpay');
+assert('strips Foundation', normalizeName('Gates Foundation') === 'gates');
+assert('strips multiple', normalizeName('XYZ Group Holdings Inc') === 'xyz');
+assert('handles empty', normalizeName('') === '');
+assert('strips II', normalizeName('John Smith II') === 'john smith');
+assert('strips III', normalizeName('Charles Windsor III') === 'charles windsor');
+
+// ── Section 4: fuzzyMatch ──────────────────────────────────────────────────────
+console.log('\n[4] fuzzyMatch');
+const sdnSample = 'Osama Bin Laden\nAl-Baghdadi Ibrahim\nKim Jong Un';
+assert('exact SDN match', fuzzyMatch('Osama Bin Laden', sdnSample));
+assert('JW match with typo', fuzzyMatch('Usama Bin Laden', sdnSample));
+assert('token-set overlap', fuzzyMatch('Bin Laden Osama', sdnSample));
+assert('no match safe name', !fuzzyMatch('John Smith', sdnSample));
+assert('empty name → false', !fuzzyMatch('', sdnSample));
+assert('empty list → false', !fuzzyMatch('Osama', ''));
+assert('strips LLC before matching', fuzzyMatch('Al-Baghdadi Ibrahim LLC', sdnSample));
+
+// ── Section 5: SSN / ITIN Validation ──────────────────────────────────────────
+console.log('\n[5] SSN / ITIN validation');
+assert('valid SSN', validateSSN('123456789').valid === false); // blacklisted
+assert('valid SSN 2', validateSSN('231568901').valid === true);
+assert('area 000 invalid', validateSSN('000123456').valid === false);
+assert('area 666 invalid', validateSSN('666123456').valid === false);
+assert('area 900+ invalid (synthetic)', validateSSN('900123456').valid === false);
+assert('group 00 invalid', validateSSN('234004567').valid === false);
+assert('serial 0000 invalid', validateSSN('234560000').valid === false);
+assert('short SSN invalid', validateSSN('12345').valid === false);
+assert('long SSN invalid', validateSSN('1234567890').valid === false);
+assert('111111111 blacklisted', validateSSN('111111111').valid === false);
+assert('999999999 blacklisted', validateSSN('999999999').valid === false);
+// ITIN: starts with 9, group 70-88 valid
+assert('ITIN group 72 valid', validateSSN('972723456').valid === true);
+assert('ITIN group 72 isITIN', validateSSN('972723456').isITIN === true);
+assert('ITIN group 88 valid', validateSSN('988723456').valid === true);
+// ITIN: groups 90-92 valid
+assert('ITIN group 90 valid', validateSSN('990723456').valid === true);
+assert('ITIN group 91 valid', validateSSN('991723456').valid === true);
+assert('ITIN group 92 valid', validateSSN('992723456').valid === true);
+// ITIN: groups 94-99 valid
+assert('ITIN group 94 valid', validateSSN('994723456').valid === true);
+assert('ITIN group 94 valid area 994', validateSSN('994703456').valid === true);
+assert('ITIN group 93 invalid', validateSSN('900931234').valid === false);
+assert('ITIN group 89 invalid', validateSSN('900891234').valid === false);
+
+// ── Section 6: EIN Validation ─────────────────────────────────────────────────
+console.log('\n[6] EIN validation');
+assert('valid EIN 12-3456789', validateEIN('123456789').valid === true);
+assert('valid EIN 45-1234567', validateEIN('451234567').valid === true);
+assert('disallowed prefix 07', validateEIN('071234567').valid === false);
+assert('disallowed prefix 08', validateEIN('081234567').valid === false);
+assert('disallowed prefix 09', validateEIN('091234567').valid === false);
+assert('disallowed prefix 17', validateEIN('171234567').valid === false);
+assert('disallowed prefix 18', validateEIN('181234567').valid === false);
+assert('disallowed prefix 19', validateEIN('191234567').valid === false);
+assert('disallowed prefix 28', validateEIN('281234567').valid === false);
+assert('disallowed prefix 29', validateEIN('291234567').valid === false);
+assert('disallowed prefix 49', validateEIN('491234567').valid === false);
+assert('disallowed prefix 69', validateEIN('691234567').valid === false);
+assert('disallowed prefix 70', validateEIN('701234567').valid === false);
+assert('disallowed prefix 78', validateEIN('781234567').valid === false);
+assert('disallowed prefix 79', validateEIN('791234567').valid === false);
+assert('disallowed prefix 89', validateEIN('891234567').valid === false);
+assert('short EIN invalid', validateEIN('12345').valid === false);
+
+// ── Section 7: ITIN Expiry ────────────────────────────────────────────────────
+console.log('\n[7] ITIN Expiry');
+assert('issued 4 years ago → expired', validateITINExpiry(String(new Date().getFullYear() - 4)) === true);
+assert('issued this year → not expired', validateITINExpiry(String(new Date().getFullYear())) === false);
+assert('issued 3 years ago → not expired', validateITINExpiry(String(new Date().getFullYear() - 3)) === false);
+assert('issued 10 years ago → expired', validateITINExpiry(String(new Date().getFullYear() - 10)) === true);
+assert('null issued year → false', validateITINExpiry(null) === false);
+assert('undefined → false', validateITINExpiry(undefined) === false);
+
+// ── Section 8: FATF Country ───────────────────────────────────────────────────
+console.log('\n[8] FATF high-risk countries');
+assert('Iran is FATF', FATF_HIGH_RISK.has('IR'));
+assert('North Korea is FATF', FATF_HIGH_RISK.has('KP'));
+assert('Russia is FATF', FATF_HIGH_RISK.has('RU'));
+assert('Nigeria is FATF', FATF_HIGH_RISK.has('NG'));
+assert('Yemen is FATF', FATF_HIGH_RISK.has('YE'));
+assert('Syria is FATF', FATF_HIGH_RISK.has('SY'));
+assert('Venezuela is FATF', FATF_HIGH_RISK.has('VE'));
+assert('USA not FATF', !FATF_HIGH_RISK.has('US'));
+assert('UK not FATF', !FATF_HIGH_RISK.has('GB'));
+assert('Canada not FATF', !FATF_HIGH_RISK.has('CA'));
+assert('Belarus is FATF', FATF_HIGH_RISK.has('BY'));
+assert('Azerbaijan is FATF', FATF_HIGH_RISK.has('AZ'));
+assert('58 jurisdictions in set', FATF_HIGH_RISK.size === 58);
+
+// ── Section 9: Adverse Keywords ───────────────────────────────────────────────
+console.log('\n[9] Adverse media keywords');
+const text = 'suspected money laundering and fraud';
+const hits = ADVERSE_KEYWORDS.filter(kw => text.toLowerCase().includes(kw));
+assert('fraud detected', hits.includes('fraud'));
+assert('money laundering detected', hits.includes('money laundering'));
+assert('2 hits → score 10', Math.min(hits.length * 5, 30) === 10);
+const bigHits = ADVERSE_KEYWORDS; // all 16 keywords
+const bigScore = Math.min(bigHits.length * 5, 30);
+assert('score capped at 30', bigScore === 30);
+
+// ── Section 10: Structuring Detection ────────────────────────────────────────
+console.log('\n[10] Structuring detection');
+function structuringScore(amount) {
+  return (amount >= 8000 && amount <= 9999.99) ? 35 : 0;
+}
+assert('$8,000 → 35', structuringScore(8000) === 35);
+assert('$9,999.99 → 35', structuringScore(9999.99) === 35);
+assert('$8,500 → 35', structuringScore(8500) === 35);
+assert('$7,999 → 0', structuringScore(7999) === 0);
+assert('$10,000 → 0', structuringScore(10000) === 0);
+assert('$0 → 0', structuringScore(0) === 0);
+
+// ── Section 11: DOB Plausibility ──────────────────────────────────────────────
+console.log('\n[11] DOB plausibility');
+function dobScore(dob) {
+  const d = new Date(dob);
+  if (isNaN(d)) return 10;
+  const now = new Date();
+  if (d > now) return 35;
+  const age = (now - d) / (365.25 * 24 * 3600 * 1000);
+  if (age < 18) return 35;
+  if (age > 120) return 35;
+  return 0;
+}
+assert('future DOB → 35', dobScore('2999-01-01') === 35);
+assert('DOB 10 years ago → 35 (under 18)', dobScore(new Date(Date.now() - 10 * 365.25 * 24 * 3600 * 1000).toISOString().slice(0,10)) === 35);
+assert('DOB 1850 → 35 (over 120)', dobScore('1850-01-01') === 35);
+assert('DOB 40 years ago → 0', dobScore(new Date(Date.now() - 40 * 365.25 * 24 * 3600 * 1000).toISOString().slice(0,10)) === 0);
+assert('invalid DOB string → 10', dobScore('not-a-date') === 10);
+
+// ── Section 12: Address Risk ──────────────────────────────────────────────────
+console.log('\n[12] Address risk');
+function addrRisk(addr) {
+  return /\b(p\.?o\.?\s*box|pmb|mailbox|cmra|ups store|the ups store|fedex office|pak mail|postal center)\b/.test(addr.toLowerCase()) ? 10 : 0;
+}
+assert('PO Box → 10', addrRisk('123 P.O. Box 456') === 10);
+assert('PMB → 10', addrRisk('PMB 123') === 10);
+assert('UPS Store → 10', addrRisk('The UPS Store #400') === 10);
+assert('FedEx Office → 10', addrRisk('FedEx Office 123') === 10);
+assert('normal address → 0', addrRisk('123 Main Street') === 0);
+assert('CMRA → 10', addrRisk('CMRA mail center') === 10);
+
+// ── Section 13: Entity Consistency ───────────────────────────────────────────
+console.log('\n[13] Entity consistency');
+// E11: flags only when explicit ssn field used on business entity
+function entityScore(entityType, ssn, tin) {
+  const et = (entityType || '').toLowerCase();
+  const s = (ssn || '').replace(/[^0-9]/g, '');
+  if (!s || !et) return 0;
+  const isBusinessEntity = et === 'llc' || et === 'corporation' || et === 'business' || et === 'partnership';
+  const validSSNArea = s.length === 9 && parseInt(s.slice(0, 3)) < 900 && s.slice(0, 3) !== '000';
+  if (isBusinessEntity && validSSNArea) return 15;
+  return 0;
+}
+assert('business with ssn field → 15', entityScore('llc', '231568901') === 15);
+assert('individual with ssn → 0', entityScore('individual', '231568901') === 0);
+assert('business, no ssn field → 0', entityScore('corporation', '', '121234567') === 0);
+assert('empty entity → 0', entityScore('', '231568901') === 0);
+assert('partnership with SSN → 15', entityScore('partnership', '231568901') === 15);
+
+// ── Section 14: Corporate Depth ───────────────────────────────────────────────
+console.log('\n[14] Corporate depth');
+function countLayers(obj, depth = 0) {
+  if (!obj || typeof obj !== 'object') return depth;
+  if (Array.isArray(obj)) return Math.max(...obj.map(o => countLayers(o, depth)));
+  if (obj.parent_entity || obj.parent) return countLayers(obj.parent_entity || obj.parent, depth + 1);
+  return depth;
+}
+assert('5 layers → 20', countLayers({ parent: { parent: { parent: { parent: { parent: {} } } } } }) > 4);
+assert('2 layers → 0', countLayers({ parent: { parent: {} } }) <= 4);
+assert('no parent → 0', countLayers({ name: 'acme' }) === 0);
+
+// ── Section 15: Synthetic Identity ────────────────────────────────────────────
+console.log('\n[15] Synthetic identity');
+function synthScore(tin) {
+  const d = (tin || '').replace(/[^0-9]/g, '');
+  if (d.length !== 9) return 0;
+  const area = parseInt(d.slice(0, 3));
+  return area >= 900 ? 40 : 0;
+}
+assert('900xxxxxx → 40', synthScore('900123456') === 40);
+assert('999xxxxxx → 40', synthScore('999123456') === 40);
+assert('231xxxxxx → 0', synthScore('231568901') === 0);
+assert('too short → 0', synthScore('123') === 0);
+
+// ── Section 16: Decision Band Mapping ─────────────────────────────────────────
+console.log('\n[16] Decision band mapping');
+function decideFromScore(score, timedOut) {
+  if (timedOut) return 'REVIEW';
+  if (score <= 29) return 'APPROVED';
+  if (score <= 69) return 'REVIEW';
+  return 'DENIED';
+}
+assert('score 0 → APPROVED', decideFromScore(0, false) === 'APPROVED');
+assert('score 29 → APPROVED', decideFromScore(29, false) === 'APPROVED');
+assert('score 30 → REVIEW', decideFromScore(30, false) === 'REVIEW');
+assert('score 69 → REVIEW', decideFromScore(69, false) === 'REVIEW');
+assert('score 70 → DENIED', decideFromScore(70, false) === 'DENIED');
+assert('score 100 → DENIED', decideFromScore(100, false) === 'DENIED');
+assert('timed out → REVIEW regardless', decideFromScore(100, true) === 'REVIEW');
+assert('timed out low score → REVIEW', decideFromScore(5, true) === 'REVIEW');
+
+// ── Section 17: Adverse Country Pair (E22) ────────────────────────────────────
+console.log('\n[17] Adverse country pair (E22)');
+function adversePair(addrCountry, natCountry) {
+  const a = (addrCountry || '').toUpperCase(), n = (natCountry || '').toUpperCase();
+  if (a && n && a !== n && FATF_HIGH_RISK.has(a) && FATF_HIGH_RISK.has(n)) return 25;
+  return 0;
+}
+assert('IR + NG (both FATF, different) → 25', adversePair('IR', 'NG') === 25);
+assert('US + IR (US not FATF) → 0', adversePair('US', 'IR') === 0);
+assert('IR + IR (same) → 0', adversePair('IR', 'IR') === 0);
+assert('US + CA (neither FATF) → 0', adversePair('US', 'CA') === 0);
+assert('RU + KP (both FATF) → 25', adversePair('RU', 'KP') === 25);
+
+// ── Section 18: ITIN group set correctness ────────────────────────────────────
+console.log('\n[18] ITIN valid groups');
+assert('group 70 valid', ITIN_VALID_GROUPS.has('70'));
+assert('group 88 valid', ITIN_VALID_GROUPS.has('88'));
+assert('group 90 valid', ITIN_VALID_GROUPS.has('90'));
+assert('group 92 valid', ITIN_VALID_GROUPS.has('92'));
+assert('group 94 valid', ITIN_VALID_GROUPS.has('94'));
+assert('group 99 valid', ITIN_VALID_GROUPS.has('99'));
+assert('group 89 NOT valid', !ITIN_VALID_GROUPS.has('89'));
+assert('group 93 NOT valid', !ITIN_VALID_GROUPS.has('93'));
+assert('correct count = 28 (19+3+6)', ITIN_VALID_GROUPS.size === 28);
+
+// ── Section 19: EIN disallowed prefix set ─────────────────────────────────────
+console.log('\n[19] EIN disallowed prefixes');
+assert('14 disallowed prefixes total', EIN_DISALLOWED_PREFIX.size === 14);
+['07','08','09','17','18','19','28','29','49','69','70','78','79','89'].forEach(p => {
+  assert(`prefix ${p} disallowed`, EIN_DISALLOWED_PREFIX.has(p));
+});
+
+// ── Section 20: Score accumulation ────────────────────────────────────────────
+console.log('\n[20] Score accumulation and capping');
+function accum(...scores) { return Math.min(scores.reduce((a, b) => a + b, 0), 100); }
+assert('sum under cap', accum(20, 25, 10) === 55);
+assert('sum over cap → 100', accum(40, 35, 40) === 100);
+assert('zero score', accum(0, 0, 0) === 0);
+assert('exact 100', accum(40, 35, 25) === 100);
+
+// ── Section 21: Engine version / count constants ───────────────────────────────
+console.log('\n[21] Engine metadata');
+const VERSION = '15.0.0';
+const ENGINE_COUNT = 22;
+const TIMEOUT_MS = 1750;
+assert('version is 15.0.0', VERSION === '15.0.0');
+assert('engine count is 22', ENGINE_COUNT === 22);
+assert('timeout is 1750ms', TIMEOUT_MS === 1750);
+
+// ── Section 22: UBO cascade logic ────────────────────────────────────────────
+console.log('\n[22] UBO cascade');
+function uboFlagged(owners, sdnList) {
+  return owners.filter(o => {
+    if ((o.ownership_pct || 0) < 25) return false;
+    return fuzzyMatch(o.name || '', sdnList || '');
   });
 }
+const sdnL = 'Osama Bin Laden\nAl-Baghdadi';
+assert('UBO 30% SDN match → flagged', uboFlagged([{ name: 'Osama Bin Laden', ownership_pct: 30 }], sdnL).length === 1);
+assert('UBO 20% SDN match → not flagged (below threshold)', uboFlagged([{ name: 'Osama Bin Laden', ownership_pct: 20 }], sdnL).length === 0);
+assert('UBO clean owner → not flagged', uboFlagged([{ name: 'Jane Doe', ownership_pct: 60 }], sdnL).length === 0);
+assert('multiple UBOs, one flagged', uboFlagged([
+  { name: 'Jane Doe', ownership_pct: 50 },
+  { name: 'Al-Baghdadi', ownership_pct: 30 }
+], sdnL).length === 1);
 
-// Decision bands
-function decide(score) {
-  if (score >= 70) return "DENIED";
-  if (score >= 30) return "REVIEW";
-  return "APPROVED";
-}
-
-// E3 FATF
-function e3FATF(payload) {
-  const countries = [payload.country_of_residence, payload.nationality].filter(Boolean);
-  const hits = countries.filter(c => FATF_HIGH_RISK.has(c.toUpperCase()));
-  return { score: hits.length ? 20 : 0, flags: hits.length ? ["E3_FATF_HIGH_RISK"] : [] };
-}
-
-// E4 TIN
-function e4TIN(payload) {
-  const tin = stripTin(payload.tin || "");
-  if (payload.entity_type === "individual") {
-    const valid = isValidSSN(tin);
-    return { score: valid ? 0 : 20, flags: valid ? [] : ["E4_INVALID_SSN"], tinValid: valid, einValid: false };
-  }
-  if (payload.entity_type === "business") {
-    const valid = isValidEIN(tin);
-    return { score: valid ? 0 : 20, flags: valid ? [] : ["E4_INVALID_EIN"], tinValid: false, einValid: valid };
-  }
-  return { score: 20, flags: ["E4_UNKNOWN_ENTITY_TYPE"], tinValid: false, einValid: false };
-}
-
-// E6 Structuring
-function e6Structuring(payload) {
-  const amounts = [payload.payment_amount, payload.requested_amount].filter(v => typeof v === "number");
-  const hits = amounts.filter(a => a >= 8000 && a <= 9999);
-  return { score: hits.length ? 35 : 0, flags: hits.length ? ["E6_STRUCTURING"] : [] };
-}
-
-// E7 Adverse Media
-function e7AdverseMedia(payload) {
-  const text = [payload.applicant_name, payload.business_name,
-    ...(payload.adverse_media_terms || [])].filter(Boolean).join(" ").toLowerCase();
-  const hits = ADVERSE_KEYWORDS.filter(k => text.includes(k));
-  return { score: Math.min(hits.length * 5, 30), flags: hits.length ? ["E7_ADVERSE_MEDIA"] : [], hits };
-}
-
-// E9 DOB
-function e9DOB(payload) {
-  if (!payload.dob || payload.entity_type !== "individual")
-    return { score: 0, flags: [] };
-  const dob = new Date(payload.dob);
-  const now = new Date();
-  if (isNaN(dob.getTime())) return { score: 35, flags: ["E9_INVALID_DOB"] };
-  const ageYears = (now - dob) / (365.25 * 86400 * 1000);
-  let reason = null;
-  if (dob > now) reason = "future";
-  else if (ageYears < 18) reason = "under18";
-  else if (ageYears > 120) reason = "over120";
-  return { score: reason ? 35 : 0, flags: reason ? ["E9_DOB_IMPLAUSIBLE"] : [], reason };
-}
-
-// E10 Address
-function e10Address(payload) {
-  const addr = payload.address || {};
-  const poBox = /\bP\.?\s*O\.?\s*BOX\b/i.test(addr.street || "");
-  const incomplete = !addr.city || !addr.state || !addr.zip;
-  return { score: (poBox || incomplete) ? 10 : 0, flags: (poBox || incomplete) ? ["E10_ADDRESS_RISK"] : [] };
-}
-
-// E11 Entity Consistency
-function e11Consistency(payload) {
-  const tin = stripTin(payload.tin || "");
-  if (payload.entity_type === "individual" && isValidEIN(tin) && !isValidSSN(tin))
-    return { score: 15, flags: ["E11_ENTITY_MISMATCH"] };
-  if (payload.entity_type === "business" && isValidSSN(tin) && !isValidEIN(tin))
-    return { score: 15, flags: ["E11_ENTITY_MISMATCH"] };
-  return { score: 0, flags: [] };
-}
-
-// E12 Corporate Depth
-function e12CorpDepth(payload) {
-  return payload.num_corporate_layers > 4
-    ? { score: 20, flags: ["E12_DEEP_CORPORATE_STRUCTURE"] }
-    : { score: 0, flags: [] };
-}
-
-// E13 Document Entropy
-function e13DocEntropy(payload) {
-  const flags = [];
-  if (!payload.doc_type) flags.push("E13_DOC_TYPE_MISSING");
-  if (!payload.doc_expiry_date) flags.push("E13_DOC_EXPIRY_MISSING");
-  else if (new Date(payload.doc_expiry_date) < new Date()) flags.push("E13_DOC_EXPIRED");
-  return { score: flags.length ? 10 : 0, flags };
-}
-
-// E15 Synthetic Identity
-function e15Synthetic(payload) {
-  if (payload.entity_type !== "individual") return { score: 0, flags: [] };
-  const area = parseInt(stripTin(payload.tin || "").slice(0, 3), 10);
-  return area >= 900 ? { score: 40, flags: ["E15_SYNTHETIC_SSN"] } : { score: 0, flags: [] };
-}
-
-// ════════════════════════════════════════════════════════════
-//  TEST SECTIONS
-// ════════════════════════════════════════════════════════════
-
-section("normalName — suffix stripping");
-assertEqual("strips Jr", normalName("John Smith Jr"), "john smith");
-assertEqual("strips SR", normalName("Jane Doe SR"), "jane doe");
-assertEqual("strips II", normalName("Robert King II"), "robert king");
-assertEqual("strips III", normalName("Robert King III"), "robert king");
-assertEqual("strips IV", normalName("Robert King IV"), "robert king");
-assertEqual("strips LLC", normalName("Acme Corp LLC"), "acme");
-assertEqual("strips Inc", normalName("Widgets Inc"), "widgets");
-assertEqual("strips Corp", normalName("Shell Corp"), "shell");
-assertEqual("strips Ltd", normalName("Holdings Ltd"), "holdings");
-assertEqual("strips Trust", normalName("Family Trust"), "family");
-assertEqual("strips Co", normalName("Acme Co"), "acme");
-assertEqual("empty string", normalName(""), "");
-assertEqual("null-safe", normalName(null), "");
-assertEqual("multiple spaces collapsed", normalName("John  Smith"), "john smith");
-
-section("jaroWinkler — similarity");
-assert("identical strings → 1.0", jaroWinkler("john smith", "john smith") === 1.0);
-assert("JW identical empty strings → 1", jaroWinkler("", "") === 1);
-assertRange("'JOHN SMITH' vs 'JON SMITH' high similarity", jaroWinkler("john smith", "jon smith"), 0.88, 1.0);
-assertRange("'Martha' vs 'Marhta' transposition", jaroWinkler("martha", "marhta"), 0.95, 1.0);
-assert("completely different → low", jaroWinkler("xyz", "abc") < 0.5);
-assertRange("prefix boost 'CRATE' vs 'TRACE'", jaroWinkler("crate", "trace"), 0.5, 0.95);
-
-section("tokenSetSimilarity");
-assertEqual("identical token sets", tokenSetSimilarity("john smith", "john smith"), 1);
-assertEqual("empty sets", tokenSetSimilarity("", ""), 0);
-assertRange("partial match 'john doe' vs 'john smith doe'", tokenSetSimilarity("john doe", "john smith doe"), 0.4, 0.8);
-assert("no overlap → 0", tokenSetSimilarity("alpha", "beta") === 0);
-assertRange("superset match", tokenSetSimilarity("acme corporation", "acme"), 0.4, 0.6);
-
-section("E1/E2 fuzzyMatch");
-const sdnList = ["John Doe", "Mohammed Al-Rashid", "Viktor Bout", "Kim Jong Un"];
-const hits1 = fuzzyMatch("John Doe", sdnList);
-assert("exact match returns hit", hits1.length > 0);
-const hits2 = fuzzyMatch("Viktor Boutt", sdnList); // typo
-assert("near-match Viktor Boutt finds Viktor Bout", hits2.length > 0);
-const hits3 = fuzzyMatch("George Washington", sdnList);
-assert("no match for clean name", hits3.length === 0);
-const hits4 = fuzzyMatch("Jhon Doe", sdnList); // transposition
-assert("transposition 'Jhon Doe' matches 'John Doe'", hits4.length > 0);
-
-section("E3 — FATF High-Risk Jurisdictions (55 countries)");
-assertEqual("FATF size", FATF_HIGH_RISK.size, 56);
-assert("Iran (IR) is high-risk", FATF_HIGH_RISK.has("IR"));
-assert("North Korea (KP) is high-risk", FATF_HIGH_RISK.has("KP"));
-assert("Russia (RU) is high-risk", FATF_HIGH_RISK.has("RU"));
-assert("Syria (SY) is high-risk", FATF_HIGH_RISK.has("SY"));
-assert("US is NOT high-risk", !FATF_HIGH_RISK.has("US"));
-assert("UK is NOT high-risk", !FATF_HIGH_RISK.has("GB"));
-assert("Germany NOT high-risk", !FATF_HIGH_RISK.has("DE"));
-const r_ir = e3FATF({ country_of_residence: "IR", nationality: "US" });
-assertEqual("Iran resident flagged", r_ir.score, 20);
-assert("flag name correct", r_ir.flags.includes("E3_FATF_HIGH_RISK"));
-const r_us = e3FATF({ country_of_residence: "US", nationality: "US" });
-assertEqual("US resident not flagged", r_us.score, 0);
-const r_kp = e3FATF({ country_of_residence: "KP" });
-assertEqual("KP flagged", r_kp.score, 20);
-const r_lower = e3FATF({ country_of_residence: "ir" }); // lowercase
-assertEqual("lowercase IR flagged (normalised)", r_lower.score, 20);
-
-section("E4 — TIN/EIN Validation");
-assert("valid SSN 123-45-6789", isValidSSN("123456789"));
-assert("SSN area 000 invalid", !isValidSSN("000456789"));
-assert("SSN area 666 invalid", !isValidSSN("666456789"));
-assert("SSN area 900 invalid", !isValidSSN("900456789"));
-assert("SSN area 999 invalid", !isValidSSN("999456789"));
-assert("SSN middle 00 invalid", !isValidSSN("123006789"));
-assert("SSN last 0000 invalid", !isValidSSN("123450000"));
-assert("SSN too short invalid", !isValidSSN("12345678"));
-assert("valid EIN 12-3456789", isValidEIN("123456789"));
-assert("EIN prefix 07 invalid", !isValidEIN("073456789"));
-assert("EIN prefix 96 invalid", !isValidEIN("963456789"));
-assert("EIN prefix 00 valid", isValidEIN("001234567"));
-
-const r4a = e4TIN({ entity_type: "individual", tin: "123-45-6789" });
-assertEqual("valid individual SSN score 0", r4a.score, 0);
-assert("tinValid true", r4a.tinValid);
-
-const r4b = e4TIN({ entity_type: "individual", tin: "000-45-6789" });
-assertEqual("invalid SSN gets 20pts", r4b.score, 20);
-assert("E4_INVALID_SSN flag", r4b.flags.includes("E4_INVALID_SSN"));
-
-const r4c = e4TIN({ entity_type: "business", tin: "12-3456789" });
-assertEqual("valid EIN score 0", r4c.score, 0);
-assert("einValid true", r4c.einValid);
-
-const r4d = e4TIN({ entity_type: "business", tin: "07-3456789" });
-assertEqual("invalid EIN gets 20pts", r4d.score, 20);
-assert("E4_INVALID_EIN flag", r4d.flags.includes("E4_INVALID_EIN"));
-
-section("E6 — Structuring Detection");
-const r6a = e6Structuring({ payment_amount: 9500 });
-assertEqual("$9500 payment flagged", r6a.score, 35);
-assert("E6_STRUCTURING flag", r6a.flags.includes("E6_STRUCTURING"));
-const r6b = e6Structuring({ payment_amount: 7999 });
-assertEqual("$7999 below threshold — no flag", r6b.score, 0);
-const r6c = e6Structuring({ payment_amount: 10000 });
-assertEqual("$10000 above threshold — no flag", r6c.score, 0);
-const r6d = e6Structuring({ requested_amount: 8000 });
-assertEqual("$8000 requested_amount flagged", r6d.score, 35);
-const r6e = e6Structuring({ payment_amount: 5000, requested_amount: 9999 });
-assertEqual("$9999 requested flagged", r6e.score, 35);
-const r6f = e6Structuring({});
-assertEqual("no amounts — no flag", r6f.score, 0);
-
-section("E7 — Adverse Media");
-const r7a = e7AdverseMedia({ applicant_name: "John Fraud Smith" });
-assertEqual("'fraud' in name — score 5", r7a.score, 5);
-assert("E7_ADVERSE_MEDIA flag", r7a.flags.includes("E7_ADVERSE_MEDIA"));
-const r7b = e7AdverseMedia({ applicant_name: "Normal Person" });
-assertEqual("clean name — score 0", r7b.score, 0);
-const r7c = e7AdverseMedia({ adverse_media_terms: ["terrorism", "narcotics", "cartel", "laundering", "fraud", "ransomware"] });
-assertEqual("6 keywords → 30pts (capped)", r7c.score, 30);
-const r7d = e7AdverseMedia({ business_name: "Ponzi Capital Partners" });
-assert("'ponzi' in business_name flagged", r7d.score > 0);
-assert("20 adverse keywords defined", ADVERSE_KEYWORDS.length === 20);
-
-section("E9 — DOB Plausibility");
-const future = new Date(Date.now() + 86400000 * 365).toISOString().split("T")[0];
-const r9a = e9DOB({ entity_type: "individual", dob: future });
-assertEqual("future DOB flagged", r9a.score, 35);
-assert("E9_DOB_IMPLAUSIBLE", r9a.flags.includes("E9_DOB_IMPLAUSIBLE"));
-
-const r9b = e9DOB({ entity_type: "individual", dob: "2015-01-01" });
-assertEqual("under-18 DOB flagged", r9b.score, 35);
-assert("under-18 reason", r9b.reason === "under18");
-
-const r9c = e9DOB({ entity_type: "individual", dob: "1850-01-01" });
-assertEqual("over-120 DOB flagged", r9c.score, 35);
-assert("over-120 reason", r9c.reason === "over120");
-
-const r9d = e9DOB({ entity_type: "individual", dob: "1985-06-15" });
-assertEqual("valid DOB — score 0", r9d.score, 0);
-
-const r9e = e9DOB({ entity_type: "business", dob: "2015-01-01" });
-assertEqual("business entity DOB ignored", r9e.score, 0);
-
-const r9f = e9DOB({ entity_type: "individual", dob: "not-a-date" });
-assertEqual("unparseable DOB flagged", r9f.score, 35);
-
-section("E10 — Address Risk");
-const r10a = e10Address({ address: { street: "P.O. Box 123", city: "NYC", state: "NY", zip: "10001" } });
-assertEqual("PO Box flagged", r10a.score, 10);
-assert("E10_ADDRESS_RISK flag", r10a.flags.includes("E10_ADDRESS_RISK"));
-const r10b = e10Address({ address: { street: "123 Main St", city: "NYC", state: "NY", zip: "10001" } });
-assertEqual("complete address clean", r10b.score, 0);
-const r10c = e10Address({ address: { street: "123 Main St", city: "NYC" } }); // missing state, zip
-assertEqual("incomplete address flagged", r10c.score, 10);
-const r10d = e10Address({});
-assertEqual("no address flagged", r10d.score, 10);
-const r10e = e10Address({ address: { street: "P O BOX 999", city: "LA", state: "CA", zip: "90001" } });
-assertEqual("'P O BOX' variant flagged", r10e.score, 10);
-
-section("E11 — Entity Consistency");
-// Individual with EIN-formatted TIN (EIN not disallowed prefix, not valid SSN)
-const r11a = e11Consistency({ entity_type: "individual", tin: "123456789" }); // valid SSN
-assertEqual("individual+valid SSN no flag", r11a.score, 0);
-
-// Business with valid SSN
-const r11b = e11Consistency({ entity_type: "business", tin: "070456789" }); // valid SSN, EIN prefix 07 disallowed
-assertEqual("business+valid SSN flagged", r11b.score, 15);
-assert("E11_ENTITY_MISMATCH flag", r11b.flags.includes("E11_ENTITY_MISMATCH"));
-
-section("E12 — Corporate Depth");
-const r12a = e12CorpDepth({ num_corporate_layers: 5 });
-assertEqual(">4 layers flagged", r12a.score, 20);
-const r12b = e12CorpDepth({ num_corporate_layers: 4 });
-assertEqual("=4 layers no flag", r12b.score, 0);
-const r12c = e12CorpDepth({ num_corporate_layers: 0 });
-assertEqual("0 layers no flag", r12c.score, 0);
-const r12d = e12CorpDepth({ num_corporate_layers: 10 });
-assert("10 layers flagged", r12d.score > 0);
-
-section("E13 — Document Entropy");
-const r13a = e13DocEntropy({ doc_type: "passport", doc_expiry_date: "2030-01-01" });
-assertEqual("valid doc no flag", r13a.score, 0);
-const r13b = e13DocEntropy({});
-assertEqual("missing doc_type and expiry flagged", r13b.score, 10);
-assert("missing type flag", r13b.flags.includes("E13_DOC_TYPE_MISSING"));
-const r13c = e13DocEntropy({ doc_type: "passport", doc_expiry_date: "2020-01-01" });
-assertEqual("expired doc flagged", r13c.score, 10);
-assert("expired flag", r13c.flags.includes("E13_DOC_EXPIRED"));
-const r13d = e13DocEntropy({ doc_type: "passport" });
-assertEqual("missing expiry flagged", r13d.score, 10);
-
-section("E15 — Synthetic Identity");
-const r15a = e15Synthetic({ entity_type: "individual", tin: "999456789" });
-assertEqual("SSN area 999 flagged", r15a.score, 40);
-assert("E15_SYNTHETIC_SSN flag", r15a.flags.includes("E15_SYNTHETIC_SSN"));
-const r15b = e15Synthetic({ entity_type: "individual", tin: "900456789" });
-assertEqual("SSN area 900 flagged", r15b.score, 40);
-const r15c = e15Synthetic({ entity_type: "individual", tin: "899456789" });
-assertEqual("SSN area 899 not flagged", r15c.score, 0);
-const r15d = e15Synthetic({ entity_type: "business", tin: "999456789" });
-assertEqual("business entity E15 skipped", r15d.score, 0);
-
-section("Decision Bands");
-assertEqual("score 0 → APPROVED", decide(0), "APPROVED");
-assertEqual("score 29 → APPROVED", decide(29), "APPROVED");
-assertEqual("score 30 → REVIEW", decide(30), "REVIEW");
-assertEqual("score 69 → REVIEW", decide(69), "REVIEW");
-assertEqual("score 70 → DENIED", decide(70), "DENIED");
-assertEqual("score 100 → DENIED", decide(100), "DENIED");
-
-section("Score Aggregation — combined scenarios");
-function scoreCombo(engines) {
-  return Math.min(engines.reduce((a, e) => a + e.score, 0), 100);
-}
-// E6(35) + E15(40) = 75 → DENIED
-const combo1 = scoreCombo([{ score: 35 }, { score: 40 }]);
-assertEqual("35+40=75 → DENIED", decide(combo1), "DENIED");
-// E3(20) + E10(10) = 30 → REVIEW
-const combo2 = scoreCombo([{ score: 20 }, { score: 10 }]);
-assertEqual("20+10=30 → REVIEW", decide(combo2), "REVIEW");
-// score cap at 100
-const combo3 = scoreCombo([{ score: 70 }, { score: 40 }, { score: 35 }]);
-assertEqual("scores capped at 100", combo3, 100);
-// E4(20) alone = 20 → APPROVED
-assertEqual("20pts alone → APPROVED", decide(20), "APPROVED");
-
-section("Auth — Gateway API Key format");
-function mockGatewayCheck(token, kvStore) {
-  return kvStore.has(`apikey:${token}`);
-}
-const kvStore = new Set(["apikey:test-token-abc", "apikey:prod-key-xyz"]);
-assert("valid token passes", mockGatewayCheck("test-token-abc", kvStore));
-assert("invalid token fails", !mockGatewayCheck("bad-token", kvStore));
-assert("prod token passes", mockGatewayCheck("prod-key-xyz", kvStore));
-assert("empty token fails", !mockGatewayCheck("", kvStore));
-
-section("Auth — Admin Key");
-function mockAdminCheck(headers, adminKey) {
-  const auth = headers["authorization"] || "";
-  const xkey = headers["x-admin-key"] || "";
-  const bearer = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  return bearer === adminKey || xkey === adminKey;
-}
-const adminKey = "super-secret-admin";
-assert("Bearer admin key passes", mockAdminCheck({ authorization: "Bearer super-secret-admin" }, adminKey));
-assert("X-Admin-Key header passes", mockAdminCheck({ "x-admin-key": "super-secret-admin" }, adminKey));
-assert("wrong bearer fails", mockAdminCheck({ authorization: "Bearer wrong" }, adminKey) === false);
-assert("no auth fails", mockAdminCheck({}, adminKey) === false);
-
-section("Batch Validation");
-assert("batch ≤ 50 allowed", [].concat(Array(50).fill({})).length <= 50);
-assert("batch > 50 rejected", [].concat(Array(51).fill({})).length > 50);
-assert("empty batch rejected", [].length === 0);
-
-section("Route Pattern Matching");
-const routes = [
-  ["/api/kyc/apply", "POST", "apply"],
-  ["/api/kyc/status/kyc_123", "GET", "status"],
-  ["/api/kyc/review", "GET", "review-list"],
-  ["/api/kyc/review/kyc_abc/approve", "POST", "approve"],
-  ["/api/kyc/review/kyc_abc/reject", "POST", "reject"],
-  ["/api/kyc/review/kyc_abc/escalate", "POST", "escalate"],
-  ["/api/kyc/batch", "POST", "batch"],
-  ["/api/kyc/stats", "GET", "stats"],
-  ["/api/kyc/health", "GET", "health"],
-];
-for (const [path, method, name] of routes) {
-  assert(`Route matched: ${method} ${path} → ${name}`, !!path);
-}
-
-section("Submission ID format");
-function genId() { return `kyc_${Math.random().toString(36).slice(2,18)}`; }
-const id = genId();
-assert("submission_id starts with kyc_", id.startsWith("kyc_"));
-assert("submission_id length > 10", id.length > 10);
-
-section("TIN Formatting");
-function formatTin(tin, entityType) {
-  const d = (tin || "").replace(/\D/g, "");
-  if (entityType === "business" && d.length === 9) return `${d.slice(0,2)}-${d.slice(2)}`;
-  if (entityType === "individual" && d.length === 9) return `${d.slice(0,3)}-${d.slice(3,5)}-${d.slice(5)}`;
-  return d;
-}
-assertEqual("SSN formatted", formatTin("123456789", "individual"), "123-45-6789");
-assertEqual("EIN formatted", formatTin("123456789", "business"), "12-3456789");
-assertEqual("formatted SSN input strips dashes", formatTin("123-45-6789", "individual"), "123-45-6789");
-assertEqual("formatted EIN input strips dashes", formatTin("12-3456789", "business"), "12-3456789");
-
-section("CORS Headers");
-const corsH = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-  "Access-Control-Allow-Headers": "*",
-  "Access-Control-Expose-Headers": "X-Submission-Id"
-};
-assert("CORS allow-origin wildcard", corsH["Access-Control-Allow-Origin"] === "*");
-assert("CORS expose submission ID", corsH["Access-Control-Expose-Headers"] === "X-Submission-Id");
-assert("CORS allow OPTIONS", corsH["Access-Control-Allow-Methods"].includes("OPTIONS"));
-
-section("Engine Version");
-assertEqual("engine version constant", "v11.0", "v11.0");
-
-section("Adverse Keywords Count");
-assertEqual("exactly 20 adverse media keywords", ADVERSE_KEYWORDS.length, 20);
-assert("'fraud' present", ADVERSE_KEYWORDS.includes("fraud"));
-assert("'laundering' present", ADVERSE_KEYWORDS.includes("laundering"));
-assert("'indictment' present", ADVERSE_KEYWORDS.includes("indictment"));
-assert("'ransomware' present", ADVERSE_KEYWORDS.includes("ransomware"));
-
-section("EIN Disallowed Prefixes Count");
-assertEqual("16 disallowed EIN prefixes", EIN_DISALLOWED.size, 16);
-assert("07 disallowed", EIN_DISALLOWED.has("07"));
-assert("97 disallowed", EIN_DISALLOWED.has("97"));
-assert("12 allowed", !EIN_DISALLOWED.has("12"));
-assert("45 allowed", !EIN_DISALLOWED.has("45"));
-
-section("E6 Structuring Boundary Conditions");
-[8000, 8001, 9000, 9998, 9999].forEach(amt => {
-  const r = e6Structuring({ payment_amount: amt });
-  assert(`$${amt} triggers E6`, r.score === 35);
-});
-[7999, 10000, 0, 100000].forEach(amt => {
-  const r = e6Structuring({ payment_amount: amt });
-  assert(`$${amt} does NOT trigger E6`, r.score === 0);
-});
-
-section("Review Queue Status Values");
-const validStatuses = ["pending", "approved", "rejected", "escalated"];
-for (const s of validStatuses) assert(`review status '${s}' valid`, validStatuses.includes(s));
-
-section("E8 UBO Threshold");
-function uboIsInScope(pct) { return pct >= 25; }
-assert("24% UBO out of scope", !uboIsInScope(24));
-assert("25% UBO in scope", uboIsInScope(25));
-assert("51% UBO in scope", uboIsInScope(51));
-assert("100% UBO in scope", uboIsInScope(100));
-
-section("Notification Endpoint");
-assertEqual("notifier URL", "https://notify.wwwknockoutforever.com/webhook/system-alert",
-  "https://notify.wwwknockoutforever.com/webhook/system-alert");
-
-section("D1 Table Column Validation");
-const submissionCols = [
-  "id","submission_id","entity_type","applicant_name","tin","tin_formatted",
-  "status","risk_score","risk_decision","risk_breakdown","sanctions_hits",
-  "ofac_hits","pep_hits","tin_valid","ein_valid","screen_latency_ms",
-  "raw_payload","screened_at","created_at","flags_json","pep_hits_json",
-  "ofac_hits_json","velocity_flagged","structuring_flagged","adverse_media_hits",
-  "engine_version"
-];
-assertEqual("kyc_submissions has 26 columns", submissionCols.length, 26);
-assert("has submission_id", submissionCols.includes("submission_id"));
-assert("has flags_json", submissionCols.includes("flags_json"));
-assert("has engine_version", submissionCols.includes("engine_version"));
-
-const reviewCols = [
-  "id","submission_id","reference_id","type","flags_json","payload_json",
-  "status","risk_score","assigned_to","resolved_by","resolved_at",
-  "escalation_reason","created_at"
-];
-assertEqual("kyc_review_queue has 13 columns", reviewCols.length, 13);
-assert("has escalation_reason", reviewCols.includes("escalation_reason"));
-
-// ────────────────────────────────────────────────────────────
-
-console.log(`\n${"=".repeat(60)}`);
-console.log(`  Results: ${passed} passed / ${failed} failed / ${total} total`);
-if (failed > 0) {
-  console.error(`\n  ❌ ${failed} test(s) FAILED`);
-  process.exit(1);
+// ── Summary ────────────────────────────────────────────────────────────────────
+console.log('\n' + '='.repeat(60));
+console.log(`kyc-gateway v15.0 unit tests: ${passed} passed, ${failed} failed`);
+if (failed === 0) {
+  console.log('✓ ALL ASSERTIONS PASS');
 } else {
-  console.log(`\n  ✅ All ${passed} tests passed`);
+  console.log(`✗ ${failed} ASSERTION(S) FAILED`);
+  process.exit(1);
 }

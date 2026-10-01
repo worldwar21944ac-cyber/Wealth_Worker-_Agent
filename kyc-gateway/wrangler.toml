@@ -1,37 +1,17 @@
-name            = "kyc-gateway"
-main            = "worker.js"
+name = "kyc-gateway"
+main = "worker.js"
 compatibility_date = "2026-09-02"
-account_id      = "fd6f05d3bbca4cc5f175ca4f7154552b"
+account_id = "fd6f05d3bbca4cc5f175ca4f7154552b"
 
-[vars]
-ENGINE_VERSION = "v11.0"
-
-# ── D1 Database ──────────────────────────────────────────────
 [[d1_databases]]
-binding    = "AUDIT_DB"
+binding = "AUDIT_DB"
 database_name = "bervashun-audit"
-database_id   = "f2fe6105-b552-42b4-a2ca-9d2a349861da"
+database_id = "f2fe6105-b552-42b4-a2ca-9d2a349861da"
 
-# ── KV Namespaces ────────────────────────────────────────────
 [[kv_namespaces]]
 binding = "KYC_SANCTIONS"
-id      = "203d064ff04b45d9b15a363aa18427be"
+id = "203d064ff04b45d9b15a363aa18427be"
 
 [[kv_namespaces]]
 binding = "GATEWAY_AUTH"
-id      = "06af84f811b84abbb1d956b639d0cd07"
-
-# ── Secrets (set via: wrangler secret put <NAME>) ────────────
-# KYC_ADMIN_KEY
-# NOTIFIER_TOKEN
-
-# ── Observability ────────────────────────────────────────────
-[observability]
-enabled = true
-
-# ── Deployment environments ──────────────────────────────────
-[env.production]
-name = "kyc-gateway"
-routes = [
-  { pattern = "kyc.wwwknockoutforever.com/*", zone_name = "wwwknockoutforever.com" }
-]
+id = "06af84f811b84abbb1d956b639d0cd07"

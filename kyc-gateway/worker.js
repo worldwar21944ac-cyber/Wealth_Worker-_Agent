@@ -1,934 +1,801 @@
-// ============================================================
-//  KYC-Gateway v11.0 — Bervashun Trust Capital
-//  Cloudflare Worker  |  ES Module  |  No external deps
-// ============================================================
+/**
+ * kyc-gateway v15.0
+ * Sub-2-second KYC/KYB Intake Screening
+ * 22 Compliance Engines | Promise.all() parallel fan-out | Cloudflare Workers ES Module
+ *
+ * Engines:
+ *   E01  OFAC SDN Name Match         40 pts  (Jaro-Winkler ≥0.82 OR token-set ≥0.80)
+ *   E02  PEP Cross-Reference         25 pts  (fuzzy name, cap 50)
+ *   E03  FATF High-Risk Country      20 pts  (58 jurisdictions)
+ *   E04  TIN/EIN Validation          20 pts  (IRS rules, disallowed prefixes)
+ *   E05  Velocity / Replay Guard     15 pts  (>5 submissions/TIN/24h)
+ *   E06  Structuring Detector        35 pts  ($8,000–$9,999 band)
+ *   E07  Adverse Media               5 pts/kw cap 30
+ *   E08  UBO Cascade                 25 pts  (≥25% beneficial owner, SDN+PEP cross-ref)
+ *   E09  DOB Plausibility            35 pts  (future | under-18 | over-120)
+ *   E10  Address Risk                10 pts  (PO Box / CMRA / known drop addr)
+ *   E11  Entity Consistency          15 pts  (individual TIN used for business)
+ *   E12  Corporate Depth             20 pts  (>4 ownership layers)
+ *   E13  Document Entropy            10 pts  (missing/expired docs)
+ *   E14  Network Graph               20 pts  (shared TIN or address across submissions)
+ *   E15  Synthetic Identity          40 pts  (SSN area 900+ | ITIN IRS group rules)
+ *   E16  Watchlist Delta             30 pts  (newly-added SDN in last 7 days)
+ *   E17  FinCEN 314(a)               25 pts  (JW ≥0.82 OR token-set ≥0.80)
+ *   E18  Geo-Velocity                20 pts  (IP jurisdiction hop <1h)
+ *   E19  Country-of-Birth FATF       15 pts  (nationality cross-ref on COB field)
+ *   E20  Second-Degree PEP Network   20 pts  (family/associates pep2:index)
+ *   E21  ITIN Expiry / Renewal Flag  10 pts  (ITIN older than 3 years without renewal)
+ *   E22  Adverse-Country Pair        25 pts  (address country ≠ nationality AND both FATF)
+ *
+ * Decision bands: 0-29 APPROVED | 30-69 REVIEW | 70-100 DENIED
+ * Hard timeout:   1750ms → auto-REVIEW
+ *
+ * Routes:
+ *   POST /api/kyc/apply
+ *   GET  /api/kyc/status/:id
+ *   GET  /api/kyc/review            (admin)
+ *   POST /api/kyc/review/:id/approve|reject|escalate  (admin)
+ *   POST /api/kyc/batch             (admin, ≤50)
+ *   GET  /api/kyc/stats             (admin)
+ *   GET  /api/kyc/health
+ *
+ * Bindings: AUDIT_DB (D1), KYC_SANCTIONS (KV), GATEWAY_AUTH (KV)
+ * Secrets:  KYC_ADMIN_KEY, NOTIFIER_TOKEN
+ */
 
-/* ─── CONSTANTS ──────────────────────────────────────────── */
+// ── Constants ──────────────────────────────────────────────────────────────────
 
-const ENGINE_VERSION = "v11.0";
-const SCREEN_TIMEOUT_MS = 1750;
+const VERSION      = '15.0.0';
+const ENGINE_COUNT = 22;
+const TIMEOUT_MS   = 1750;
+const APPROVE_MAX  = 29;
+const REVIEW_MAX   = 69;
 
 const FATF_HIGH_RISK = new Set([
-  "AF","AL","AO","BB","BF","BI","BJ","BT","CF","CM","CG","CD","CI","CU",
-  "DZ","ER","ET","GH","GN","GW","HT","IR","IQ","JM","JO","KE","KH","KP",
-  "LA","LB","LR","LY","ML","MM","MR","MZ","NE","NG","NI","PA","PH","PK",
-  "RU","SD","SL","SO","SS","SY","TJ","TN","TT","UG","VU","YE","ZW","VE"
+  'AF','AL','AO','BB','BF','BJ','BI','CM','CD','CF','CG','CU','ET','GH','GN','GW','GY',
+  'HT','IQ','IR','KP','LB','LR','LY','ML','MM','MR','MZ','NE','NG','PA','PK','PH','RU',
+  'SD','SL','SN','SO','SS','SY','TG','TJ','TM','TT','TR','UA','UG','VE','VU','YE','ZW',
+  'BY','KZ','UZ','AZ','AM','GE','KG'
 ]);
 
 const ADVERSE_KEYWORDS = [
-  "fraud","laundering","trafficking","cartel","terrorism","corruption",
-  "bribery","sanctions","embezzlement","extortion","forgery","counterfeiting",
-  "ransomware","cybercrime","narcotics","ponzi","smuggling","terrorist",
-  "felony","indictment"
+  'fraud','money laundering','terrorist','trafficking','sanction','cartel',
+  'corruption','bribery','ponzi','embezzlement','cybercrime','darknet',
+  'narco','smuggling','extortion','organized crime'
 ];
 
-const EIN_DISALLOWED_PREFIXES = new Set([
-  "07","08","09","17","18","19","28","29","49","69","70","78","79","89","96","97"
+const EIN_DISALLOWED_PREFIX = new Set([
+  '07','08','09','17','18','19','28','29','49','69','70','78','79','89'
 ]);
 
-const SUFFIX_RE = /\b(jr|sr|ii|iii|iv|llc|inc|corp|ltd|co|trust)\b\.?/gi;
+// ITIN area numbers that are valid (IRS-assigned)
+// ITINs start with 9. Middle two digits (group) 70-88, 90-92, 94-99 are valid
+const ITIN_VALID_GROUPS = (() => {
+  const g = new Set();
+  for (let i = 70; i <= 88; i++) g.add(String(i));
+  for (let i = 90; i <= 92; i++) g.add(String(i));
+  for (let i = 94; i <= 99; i++) g.add(String(i));
+  return g;
+})();
 
-/* ─── UTILITIES ──────────────────────────────────────────── */
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
-function normalName(s) {
-  if (!s) return "";
-  return s.replace(SUFFIX_RE, "").replace(/\s+/g, " ").trim().toLowerCase();
+function cors(res) {
+  const h = new Headers(res.headers);
+  h.set('Access-Control-Allow-Origin', '*');
+  h.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  h.set('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-API-Key');
+  h.set('Access-Control-Expose-Headers', 'X-Submission-Id,X-Risk-Score,X-Risk-Decision,X-Engine-Version');
+  return new Response(res.body, { status: res.status, headers: h });
 }
 
-function jaroWinkler(a, b) {
-  a = a.toLowerCase(); b = b.toLowerCase();
-  if (a === b) return 1;
-  const la = a.length, lb = b.length;
-  if (!la || !lb) return 0;
-  const matchDist = Math.max(Math.floor(Math.max(la, lb) / 2) - 1, 0);
-  const aMatched = new Uint8Array(la);
-  const bMatched = new Uint8Array(lb);
-  let matches = 0, transpositions = 0;
-  for (let i = 0; i < la; i++) {
-    const lo = Math.max(0, i - matchDist);
-    const hi = Math.min(lb - 1, i + matchDist);
-    for (let j = lo; j <= hi; j++) {
-      if (bMatched[j] || a[i] !== b[j]) continue;
-      aMatched[i] = bMatched[j] = 1; matches++; break;
+function json(body, status = 200, extra = {}) {
+  return cors(new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...extra }
+  }));
+}
+
+function uid() {
+  return crypto.randomUUID();
+}
+
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Jaro-Winkler similarity (0–1)
+function jaroWinkler(s1, s2) {
+  if (!s1 || !s2) return 0;
+  s1 = s1.toLowerCase(); s2 = s2.toLowerCase();
+  if (s1 === s2) return 1;
+  const len1 = s1.length, len2 = s2.length;
+  const matchDist = Math.floor(Math.max(len1, len2) / 2) - 1;
+  if (matchDist < 0) return 0;
+  const s1m = Array(len1).fill(false), s2m = Array(len2).fill(false);
+  let matches = 0, trans = 0;
+  for (let i = 0; i < len1; i++) {
+    const lo = Math.max(0, i - matchDist), hi = Math.min(i + matchDist + 1, len2);
+    for (let j = lo; j < hi; j++) {
+      if (!s2m[j] && s1[i] === s2[j]) { s1m[i] = s2m[j] = true; matches++; break; }
     }
   }
   if (!matches) return 0;
   let k = 0;
-  for (let i = 0; i < la; i++) {
-    if (!aMatched[i]) continue;
-    while (!bMatched[k]) k++;
-    if (a[i] !== b[k]) transpositions++;
-    k++;
+  for (let i = 0; i < len1; i++) {
+    if (s1m[i]) {
+      while (!s2m[k]) k++;
+      if (s1[i] !== s2[k]) trans++;
+      k++;
+    }
   }
-  const jaro = (matches / la + matches / lb + (matches - transpositions / 2) / matches) / 3;
-  const pfxLen = Math.min(4, [...a].findIndex((c, i) => c !== b[i]) >>> 0);
-  return jaro + pfxLen * 0.1 * (1 - jaro);
+  const jaro = (matches / len1 + matches / len2 + (matches - trans / 2) / matches) / 3;
+  let prefix = 0;
+  for (let i = 0; i < Math.min(4, len1, len2); i++) {
+    if (s1[i] === s2[i]) prefix++; else break;
+  }
+  return jaro + prefix * 0.1 * (1 - jaro);
 }
 
-function tokenSetSimilarity(a, b) {
-  const tokA = new Set(a.toLowerCase().split(/\s+/).filter(Boolean));
-  const tokB = new Set(b.toLowerCase().split(/\s+/).filter(Boolean));
-  const inter = [...tokA].filter(t => tokB.has(t)).length;
-  const union = new Set([...tokA, ...tokB]).size;
+// Token-set similarity
+function tokenSetSim(a, b) {
+  if (!a || !b) return 0;
+  const ta = new Set(a.toLowerCase().split(/\s+/));
+  const tb = new Set(b.toLowerCase().split(/\s+/));
+  const inter = [...ta].filter(x => tb.has(x)).length;
+  const union = new Set([...ta, ...tb]).size;
   return union === 0 ? 0 : inter / union;
 }
 
-function fuzzyMatch(name, list) {
-  const n = normalName(name);
-  const hits = [];
-  for (const entry of list) {
-    const e = normalName(typeof entry === "string" ? entry : entry.name || "");
-    const jw = jaroWinkler(n, e);
-    const ts = tokenSetSimilarity(n, e);
-    if (jw >= 0.82 || ts >= 0.80) {
-      hits.push({ entry: typeof entry === "string" ? entry : entry.name, jw: +jw.toFixed(4), ts: +ts.toFixed(4) });
-    }
+// Strip suffixes/titles before matching
+function normalizeName(raw) {
+  if (!raw) return '';
+  return raw
+    .toLowerCase()
+    .replace(/\b(jr|sr|ii|iii|iv|v|llc|inc|corp|ltd|co|plc|group|holdings|international|intl|trust|foundation|the)\b\.?/g, '')
+    .replace(/[^a-z0-9 ]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Fuzzy name match against a list string
+function fuzzyMatch(name, listStr, threshold = 0.82) {
+  if (!name || !listStr) return false;
+  const norm = normalizeName(name);
+  const entries = listStr.split('\n').map(e => normalizeName(e.trim())).filter(Boolean);
+  for (const entry of entries) {
+    if (jaroWinkler(norm, entry) >= threshold || tokenSetSim(norm, entry) >= 0.80) return true;
   }
-  return hits;
+  return false;
 }
 
-function stripTin(tin) {
-  return (tin || "").replace(/\D/g, "");
+// ── TIN Validation ─────────────────────────────────────────────────────────────
+
+function validateSSN(ssn) {
+  const d = ssn.replace(/[^0-9]/g, '');
+  if (d.length !== 9) return { valid: false, reason: 'bad_length' };
+  const area = d.slice(0, 3), group = d.slice(3, 5), serial = d.slice(5); // serial = last 4 digits
+  // ITIN check FIRST: area 900-999 = IRS-assigned ITIN range
+  if (parseInt(area) >= 900) {
+    if (area === '999' && group === '99') return { valid: false, reason: 'blacklisted_itin' };
+    if (!ITIN_VALID_GROUPS.has(group)) return { valid: false, reason: 'invalid_itin_group' };
+    return { valid: true, isITIN: true };
+  }
+  // SSN-specific invalids
+  if (area === '000' || area === '666') return { valid: false, reason: 'invalid_area' };
+  if (group === '00') return { valid: false, reason: 'zero_group' };
+  if (serial === '0000') return { valid: false, reason: 'zero_serial' };
+  if (d === '123456789' || d === '111111111' || d === '999999999')
+    return { valid: false, reason: 'blacklisted' };
+  return { valid: true, isITIN: false };
 }
 
-function formatTin(tin, entityType) {
-  const d = stripTin(tin);
-  if (entityType === "business" && d.length === 9) return `${d.slice(0,2)}-${d.slice(2)}`;
-  if (entityType === "individual" && d.length === 9) return `${d.slice(0,3)}-${d.slice(3,5)}-${d.slice(5)}`;
-  return d;
-}
-
-function isValidSSN(tin) {
-  const d = stripTin(tin);
-  if (d.length !== 9) return false;
-  const area = +d.slice(0, 3);
-  if (area === 0 || area === 666 || area >= 900) return false;
-  if (d.slice(3, 5) === "00") return false;
-  if (d.slice(5) === "0000") return false;
-  return true;
-}
-
-function isValidEIN(tin) {
-  const d = stripTin(tin);
-  if (d.length !== 9) return false;
+function validateEIN(ein) {
+  const d = ein.replace(/[^0-9]/g, '');
+  if (d.length !== 9) return { valid: false, reason: 'bad_length' };
   const prefix = d.slice(0, 2);
-  if (EIN_DISALLOWED_PREFIXES.has(prefix)) return false;
-  return true;
+  if (EIN_DISALLOWED_PREFIX.has(prefix)) return { valid: false, reason: 'disallowed_prefix' };
+  return { valid: true };
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+function validateITINExpiry(itinIssuedYear) {
+  // ITINs issued before 2013 or not renewed every 3 years are expired per IRS
+  if (!itinIssuedYear) return false;
+  const age = new Date().getFullYear() - parseInt(itinIssuedYear);
+  return age > 3;
 }
 
-function uuid() { return crypto.randomUUID(); }
+// ── Engine Implementations ─────────────────────────────────────────────────────
 
-function nowISO() { return new Date().toISOString(); }
-
-function corsHeaders(req) {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "*",
-    "Access-Control-Expose-Headers": "X-Submission-Id",
-  };
+async function engineOFAC(payload, env) {
+  const sdnList = await env.KYC_SANCTIONS.get('sdn:index');
+  if (!sdnList) return { score: 0, hits: [] };
+  const name = payload.name || payload.business_name || '';
+  if (fuzzyMatch(name, sdnList)) return { score: 40, hits: [name] };
+  return { score: 0, hits: [] };
 }
 
-function jsonResp(data, status = 200, extra = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json", ...extra }
-  });
+async function enginePEP(payload, env) {
+  const pepList = await env.KYC_SANCTIONS.get('pep:index');
+  if (!pepList) return { score: 0, hits: [] };
+  const name = payload.name || payload.business_name || '';
+  if (fuzzyMatch(name, pepList, 0.82)) return { score: 25, hits: [name] };
+  return { score: 0, hits: [] };
 }
 
-function errResp(msg, status, cors = {}) {
-  return new Response(JSON.stringify({ error: msg }), {
-    status,
-    headers: { "Content-Type": "application/json", ...cors }
-  });
+async function engineFATF(payload) {
+  const country = (payload.address?.country || payload.country || '').toUpperCase();
+  if (FATF_HIGH_RISK.has(country)) return { score: 20, country };
+  return { score: 0 };
 }
 
-async function parseKVList(kv, key) {
-  try {
-    const raw = await kv.get(key, { type: "json" });
-    if (Array.isArray(raw)) return raw;
-    return [];
-  } catch { return []; }
-}
-
-/* ─── AUTH ───────────────────────────────────────────────── */
-
-async function verifyGatewayAuth(req, env) {
-  const auth = req.headers.get("Authorization") || "";
-  if (!auth.startsWith("Bearer ")) return false;
-  const token = auth.slice(7).trim();
-  const val = await env.GATEWAY_AUTH.get(`apikey:${token}`);
-  return val !== null;
-}
-
-function verifyAdminKey(req, env) {
-  const authHeader = req.headers.get("Authorization") || "";
-  const adminHeader = req.headers.get("X-Admin-Key") || "";
-  const fromBearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
-  return fromBearer === env.KYC_ADMIN_KEY || adminHeader === env.KYC_ADMIN_KEY;
-}
-
-/* ─── 18 SCREENING ENGINES ───────────────────────────────── */
-
-async function engineE1_OFAC(payload, env) {
-  const list = await parseKVList(env.KYC_SANCTIONS, "sdn:index");
-  const names = [payload.applicant_name, payload.business_name].filter(Boolean);
-  let score = 0; const flags = []; const detail = [];
-  for (const name of names) {
-    const hits = fuzzyMatch(name, list);
-    if (hits.length) {
-      score = Math.min(score + 40 * hits.length, 70);
-      flags.push("E1_OFAC_HIT");
-      detail.push(...hits.map(h => ({ name, match: h.entry, jw: h.jw, ts: h.ts })));
-    }
-  }
-  return { engine: "E1_OFAC_SDN", score, flags, detail };
-}
-
-async function engineE2_PEP(payload, env) {
-  const list = await parseKVList(env.KYC_SANCTIONS, "pep:index");
-  const names = [payload.applicant_name, payload.business_name].filter(Boolean);
-  let score = 0; const flags = []; const detail = [];
-  for (const name of names) {
-    const hits = fuzzyMatch(name, list);
-    if (hits.length) {
-      score = Math.min(score + 25 * hits.length, 50);
-      flags.push("E2_PEP_HIT");
-      detail.push(...hits.map(h => ({ name, match: h.entry, jw: h.jw, ts: h.ts })));
-    }
-  }
-  return { engine: "E2_PEP", score, flags, detail };
-}
-
-function engineE3_FATF(payload) {
-  const countries = [payload.country_of_residence, payload.nationality,
-    ...(payload.beneficial_owners || []).map(b => b.nationality)].filter(Boolean);
-  const hits = countries.filter(c => FATF_HIGH_RISK.has(c.toUpperCase()));
-  const score = hits.length ? 20 : 0;
-  return {
-    engine: "E3_FATF_HIGH_RISK",
-    score,
-    flags: hits.length ? ["E3_FATF_HIGH_RISK"] : [],
-    detail: hits
-  };
-}
-
-function engineE4_TIN(payload) {
-  const tin = stripTin(payload.tin || "");
-  const entityType = payload.entity_type;
-  let score = 0; const flags = []; const detail = [];
-  let tinValid = false, einValid = false;
-  if (entityType === "individual") {
-    tinValid = isValidSSN(tin);
-    if (!tinValid) { score = 20; flags.push("E4_INVALID_SSN"); detail.push({ tin, reason: "SSN failed validation" }); }
-  } else if (entityType === "business") {
-    einValid = isValidEIN(tin);
-    if (!einValid) { score = 20; flags.push("E4_INVALID_EIN"); detail.push({ tin, reason: "EIN failed validation" }); }
+async function engineTIN(payload) {
+  const entityType = (payload.entity_type || 'individual').toLowerCase();
+  const tin = (payload.tin || payload.ssn || payload.ein || '').replace(/[^0-9]/g, '');
+  if (!tin) return { score: 20, reason: 'missing_tin' };
+  if (entityType === 'individual' || entityType === 'sole_prop') {
+    const res = validateSSN(tin);
+    if (!res.valid) return { score: 20, reason: res.reason };
+    return { score: 0, isITIN: res.isITIN };
   } else {
-    score = 20; flags.push("E4_UNKNOWN_ENTITY_TYPE"); detail.push({ tin, reason: "Unknown entity type" });
-  }
-  return { engine: "E4_TIN_EIN", score, flags, detail, tinValid, einValid };
-}
-
-async function engineE5_Velocity(payload, env) {
-  const tin = stripTin(payload.tin || "");
-  if (!tin) return { engine: "E5_VELOCITY", score: 0, flags: [], detail: [] };
-  try {
-    const cutoff = new Date(Date.now() - 86400000).toISOString();
-    const res = await env.AUDIT_DB.prepare(
-      `SELECT COUNT(*) as cnt FROM kyc_submissions WHERE tin=? AND created_at>=?`
-    ).bind(tin, cutoff).first();
-    const cnt = res?.cnt ?? 0;
-    const flagged = cnt > 5;
-    return {
-      engine: "E5_VELOCITY",
-      score: flagged ? 15 : 0,
-      flags: flagged ? ["E5_VELOCITY_FLAGGED"] : [],
-      detail: { tin, count_24h: cnt }
-    };
-  } catch (e) {
-    return { engine: "E5_VELOCITY", score: 0, flags: [], detail: { error: e.message } };
+    const res = validateEIN(tin);
+    if (!res.valid) return { score: 20, reason: res.reason };
+    return { score: 0 };
   }
 }
 
-function engineE6_Structuring(payload) {
-  const amounts = [payload.payment_amount, payload.requested_amount].filter(v => typeof v === "number");
-  const hits = amounts.filter(a => a >= 8000 && a <= 9999);
-  return {
-    engine: "E6_STRUCTURING",
-    score: hits.length ? 35 : 0,
-    flags: hits.length ? ["E6_STRUCTURING"] : [],
-    detail: { amounts_flagged: hits }
-  };
+async function engineVelocity(payload, env) {
+  const tin = (payload.tin || payload.ssn || payload.ein || '').replace(/[^0-9]/g, '');
+  if (!tin) return { score: 0 };
+  const key = `vel:${tin}`;
+  const existing = await env.KYC_SANCTIONS.get(key);
+  const count = existing ? parseInt(existing) : 0;
+  // Increment (fire-and-forget)
+  await env.KYC_SANCTIONS.put(key, String(count + 1), { expirationTtl: 86400 });
+  if (count >= 5) return { score: 15, count: count + 1 };
+  return { score: 0, count: count + 1 };
 }
 
-function engineE7_AdverseMedia(payload) {
-  const text = [payload.applicant_name, payload.business_name,
-    ...(payload.adverse_media_terms || [])].filter(Boolean).join(" ").toLowerCase();
-  const hits = ADVERSE_KEYWORDS.filter(k => text.includes(k));
+async function engineStructuring(payload) {
+  const amount = parseFloat(payload.transaction_amount || payload.amount || 0);
+  if (amount >= 8000 && amount <= 9999.99) return { score: 35, amount };
+  return { score: 0 };
+}
+
+async function engineAdverseMedia(payload) {
+  const text = JSON.stringify(payload).toLowerCase();
+  const hits = ADVERSE_KEYWORDS.filter(kw => text.includes(kw));
   const score = Math.min(hits.length * 5, 30);
-  return {
-    engine: "E7_ADVERSE_MEDIA",
-    score,
-    flags: hits.length ? ["E7_ADVERSE_MEDIA"] : [],
-    detail: { keywords_matched: hits }
-  };
+  return { score, hits };
 }
 
-async function engineE8_UBO(payload, env) {
-  const owners = (payload.beneficial_owners || []).filter(b => (b.ownership_pct || 0) >= 25);
-  if (!owners.length) return { engine: "E8_UBO_CASCADE", score: 0, flags: [], detail: [], uboResults: [] };
-  const [sdnList, pepList] = await Promise.all([
-    parseKVList(env.KYC_SANCTIONS, "sdn:index"),
-    parseKVList(env.KYC_SANCTIONS, "pep:index")
-  ]);
-  const uboResults = [];
-  let score = 0; const flags = [];
-  for (const owner of owners) {
-    const sdnHits = fuzzyMatch(owner.name, sdnList);
-    const pepHits = fuzzyMatch(owner.name, pepList);
-    const ownerFlagged = sdnHits.length > 0 || pepHits.length > 0;
-    if (ownerFlagged) {
-      score = Math.min(score + 25, 100);
-      flags.push("E8_UBO_FLAGGED");
-    }
-    uboResults.push({
-      name: owner.name,
-      ownership_pct: owner.ownership_pct,
-      tin: owner.tin,
-      nationality: owner.nationality,
-      sanctionsScore: Math.min(sdnHits.length * 40, 70),
-      pepFlag: pepHits.length > 0 ? 1 : 0,
-      ofacHit: sdnHits.length > 0 ? 1 : 0,
-      isFlagged: ownerFlagged ? 1 : 0,
-      matchReason: [
-        sdnHits.length ? `OFAC:${sdnHits[0].match}` : null,
-        pepHits.length ? `PEP:${pepHits[0].match}` : null
-      ].filter(Boolean).join(", ")
-    });
+async function engineUBO(payload, env) {
+  const owners = payload.beneficial_owners || [];
+  if (!owners.length) return { score: 0 };
+  const sdnList = await env.KYC_SANCTIONS.get('sdn:index');
+  const pepList = await env.KYC_SANCTIONS.get('pep:index');
+  const flagged = [];
+  for (const o of owners) {
+    if ((o.ownership_pct || 0) < 25) continue;
+    const name = o.name || '';
+    const sdnHit = sdnList && fuzzyMatch(name, sdnList);
+    const pepHit = pepList && fuzzyMatch(name, pepList, 0.82);
+    if (sdnHit || pepHit) flagged.push({ name, sdnHit, pepHit });
   }
-  return { engine: "E8_UBO_CASCADE", score, flags, detail: uboResults, uboResults };
+  return { score: flagged.length ? 25 : 0, flagged };
 }
 
-function engineE9_DOB(payload) {
-  if (!payload.dob || payload.entity_type !== "individual") {
-    return { engine: "E9_DOB_PLAUSIBILITY", score: 0, flags: [], detail: {} };
-  }
-  const dob = new Date(payload.dob);
+async function engineDOB(payload) {
+  const dob = payload.dob || payload.date_of_birth || '';
+  if (!dob) return { score: 0 };
+  const d = new Date(dob);
+  if (isNaN(d)) return { score: 10, reason: 'invalid_date' };
   const now = new Date();
-  if (isNaN(dob.getTime())) {
-    return { engine: "E9_DOB_PLAUSIBILITY", score: 35, flags: ["E9_INVALID_DOB"], detail: { reason: "unparseable" } };
+  if (d > now) return { score: 35, reason: 'future_dob' };
+  const ageYears = (now - d) / (365.25 * 24 * 3600 * 1000);
+  if (ageYears < 18) return { score: 35, reason: 'under_18', age: Math.floor(ageYears) };
+  if (ageYears > 120) return { score: 35, reason: 'over_120', age: Math.floor(ageYears) };
+  return { score: 0, age: Math.floor(ageYears) };
+}
+
+async function engineAddressRisk(payload) {
+  const addr = JSON.stringify(payload.address || {}).toLowerCase();
+  const poBad = /\b(p\.?o\.?\s*box|pmb|mailbox|cmra|ups store|the ups store|fedex office|pak mail|postal center)\b/.test(addr);
+  return { score: poBad ? 10 : 0, poBad };
+}
+
+async function engineEntityConsistency(payload) {
+  const et = (payload.entity_type || '').toLowerCase();
+  // Only flag if the payload explicitly submits an SSN field for a business entity
+  // (not generic tin= which could be EIN)
+  const ssn = (payload.ssn || '').replace(/[^0-9]/g, '');
+  if (!ssn || !et) return { score: 0 };
+  const isBusinessEntity = et === 'llc' || et === 'corporation' || et === 'business' || et === 'partnership';
+  const validSSNArea = ssn.length === 9 && parseInt(ssn.slice(0, 3)) < 900 && ssn.slice(0, 3) !== '000';
+  if (isBusinessEntity && validSSNArea)
+    return { score: 15, reason: 'individual_ssn_on_business_entity' };
+  return { score: 0 };
+}
+
+async function engineCorporateDepth(payload) {
+  function countLayers(obj, depth = 0) {
+    if (!obj || typeof obj !== 'object') return depth;
+    if (Array.isArray(obj)) return Math.max(...obj.map(o => countLayers(o, depth)));
+    if (obj.parent_entity || obj.parent) return countLayers(obj.parent_entity || obj.parent, depth + 1);
+    return depth;
   }
-  const ageMs = now - dob;
-  const ageYears = ageMs / (365.25 * 86400 * 1000);
-  let reason = null;
-  if (dob > now) reason = "DOB in the future";
-  else if (ageYears < 18) reason = "Under 18";
-  else if (ageYears > 120) reason = "Over 120 years old";
-  return {
-    engine: "E9_DOB_PLAUSIBILITY",
-    score: reason ? 35 : 0,
-    flags: reason ? ["E9_DOB_IMPLAUSIBLE"] : [],
-    detail: { dob: payload.dob, ageYears: +ageYears.toFixed(2), reason }
-  };
+  const depth = countLayers(payload);
+  return { score: depth > 4 ? 20 : 0, depth };
 }
 
-function engineE10_Address(payload) {
-  const addr = payload.address || {};
-  const street = (addr.street || "").toUpperCase();
-  const poBox = /\bP\.?\s*O\.?\s*BOX\b/i.test(street);
-  const incomplete = !addr.city || !addr.state || !addr.zip;
-  const flagged = poBox || incomplete;
-  return {
-    engine: "E10_ADDRESS_RISK",
-    score: flagged ? 10 : 0,
-    flags: flagged ? ["E10_ADDRESS_RISK"] : [],
-    detail: { po_box: poBox, incomplete }
-  };
+async function engineDocumentEntropy(payload) {
+  const docs = payload.documents || [];
+  if (!docs.length) return { score: 10, reason: 'no_documents' };
+  const now = Date.now();
+  const expired = docs.filter(d => d.expiry && new Date(d.expiry) < now);
+  if (expired.length) return { score: 10, reason: 'expired_document', count: expired.length };
+  return { score: 0 };
 }
 
-function engineE11_EntityConsistency(payload) {
-  const tin = stripTin(payload.tin || "");
-  const flags = [];
-  let reason = null;
-  if (payload.entity_type === "individual" && isValidEIN(tin) && !isValidSSN(tin)) {
-    flags.push("E11_ENTITY_MISMATCH");
-    reason = "Individual entity but EIN-format TIN provided";
-  } else if (payload.entity_type === "business" && isValidSSN(tin) && !isValidEIN(tin)) {
-    flags.push("E11_ENTITY_MISMATCH");
-    reason = "Business entity but SSN-format TIN provided";
+async function engineNetworkGraph(payload, env) {
+  const tin = (payload.tin || payload.ssn || payload.ein || '').replace(/[^0-9]/g, '');
+  const addrKey = JSON.stringify(payload.address || {}).toLowerCase().replace(/\s+/g, '');
+  const netKey = `net:${tin}`;
+  const addrKV = `neta:${addrKey.slice(0, 64)}`;
+  const [prevTin, prevAddr] = await Promise.all([
+    tin ? env.KYC_SANCTIONS.get(netKey) : Promise.resolve(null),
+    addrKey ? env.KYC_SANCTIONS.get(addrKV) : Promise.resolve(null)
+  ]);
+  // Store for future cross-referencing
+  const tasks = [];
+  if (tin) tasks.push(env.KYC_SANCTIONS.put(netKey, '1', { expirationTtl: 604800 }));
+  if (addrKey) tasks.push(env.KYC_SANCTIONS.put(addrKV, '1', { expirationTtl: 604800 }));
+  await Promise.all(tasks);
+  if (prevTin || prevAddr) return { score: 20, sharedTin: !!prevTin, sharedAddr: !!prevAddr };
+  return { score: 0 };
+}
+
+async function engineSyntheticId(payload) {
+  const tin = (payload.ssn || payload.tin || '').replace(/[^0-9]/g, '');
+  if (!tin || tin.length !== 9) return { score: 0 };
+  const area = parseInt(tin.slice(0, 3));
+  if (area >= 900) return { score: 40, reason: 'synthetic_area_900plus' };
+  return { score: 0 };
+}
+
+async function engineWatchlistDelta(payload, env) {
+  const sdnDelta = await env.KYC_SANCTIONS.get('sdn:delta:7d');
+  if (!sdnDelta) return { score: 0 };
+  const name = payload.name || payload.business_name || '';
+  if (fuzzyMatch(name, sdnDelta)) return { score: 30, reason: 'newly_listed' };
+  return { score: 0 };
+}
+
+async function engineFinCEN314a(payload, env) {
+  const list = await env.KYC_SANCTIONS.get('fincen:314a');
+  if (!list) return { score: 0 };
+  const name = payload.name || payload.business_name || '';
+  if (fuzzyMatch(name, list)) return { score: 25, hits: [name] };
+  return { score: 0 };
+}
+
+async function engineGeoVelocity(payload, env, ip) {
+  if (!ip) return { score: 0 };
+  const tin = (payload.tin || payload.ssn || payload.ein || '').replace(/[^0-9]/g, '');
+  if (!tin) return { score: 0 };
+  const geoKey = `geo:${tin}`;
+  const prev = await env.KYC_SANCTIONS.get(geoKey, { type: 'json' });
+  const now = Date.now();
+  const ipHash = await sha256Hex(ip);
+  await env.KYC_SANCTIONS.put(geoKey, JSON.stringify({ ipHash, ts: now }), { expirationTtl: 3600 });
+  if (prev && prev.ipHash !== ipHash && (now - prev.ts) < 3600000) {
+    return { score: 20, reason: 'ip_hop_under_1h' };
   }
-  return { engine: "E11_ENTITY_CONSISTENCY", score: flags.length ? 15 : 0, flags, detail: { reason } };
+  return { score: 0 };
 }
 
-function engineE12_CorporateDepth(payload) {
-  const layers = payload.num_corporate_layers ?? 0;
-  const flagged = layers > 4;
-  return {
-    engine: "E12_CORPORATE_DEPTH",
-    score: flagged ? 20 : 0,
-    flags: flagged ? ["E12_DEEP_CORPORATE_STRUCTURE"] : [],
-    detail: { num_corporate_layers: layers }
-  };
+async function engineCOBFATF(payload) {
+  // E19: Country-of-Birth cross-ref against FATF list
+  const cob = (payload.country_of_birth || payload.nationality || '').toUpperCase();
+  if (cob && FATF_HIGH_RISK.has(cob)) return { score: 15, country: cob };
+  return { score: 0 };
 }
 
-function engineE13_DocumentEntropy(payload) {
-  const flags = [];
-  const detail = {};
-  if (!payload.doc_type) { flags.push("E13_DOC_TYPE_MISSING"); detail.missing_type = true; }
-  if (payload.doc_expiry_date) {
-    const exp = new Date(payload.doc_expiry_date);
-    const now = new Date();
-    if (!isNaN(exp.getTime()) && exp < now) {
-      flags.push("E13_DOC_EXPIRED");
-      detail.expired = true;
-      detail.expiry = payload.doc_expiry_date;
-    }
-  } else {
-    flags.push("E13_DOC_EXPIRY_MISSING");
-    detail.missing_expiry = true;
+async function engineSecondDegreePEP(payload, env) {
+  // E20: Associates / family of PEP
+  const list = await env.KYC_SANCTIONS.get('pep2:index');
+  if (!list) return { score: 0 };
+  const name = payload.name || payload.business_name || '';
+  if (fuzzyMatch(name, list, 0.82)) return { score: 20, reason: 'second_degree_pep' };
+  return { score: 0 };
+}
+
+async function engineITINExpiry(payload) {
+  // E21: ITIN renewal check
+  const tin = (payload.ssn || payload.tin || '').replace(/[^0-9]/g, '');
+  if (!tin || tin.length !== 9) return { score: 0 };
+  const area = parseInt(tin.slice(0, 3));
+  if (area < 900) return { score: 0 }; // Not an ITIN
+  const itinIssuedYear = payload.itin_issued_year;
+  if (itinIssuedYear && validateITINExpiry(itinIssuedYear)) {
+    return { score: 10, reason: 'itin_expired_or_renewal_needed', issued: itinIssuedYear };
   }
-  return { engine: "E13_DOCUMENT_ENTROPY", score: flags.length ? 10 : 0, flags, detail };
+  return { score: 0 };
 }
 
-async function engineE14_NetworkGraph(payload, env) {
-  const tin = stripTin(payload.tin || "");
-  const street = (payload.address || {}).street || "";
-  const flags = []; const detail = {};
-  try {
-    if (tin) {
-      const res = await env.AUDIT_DB.prepare(
-        `SELECT COUNT(DISTINCT applicant_name) as cnt FROM kyc_submissions WHERE tin=? AND applicant_name!=?`
-      ).bind(tin, payload.applicant_name || "").first();
-      if ((res?.cnt ?? 0) > 0) {
-        flags.push("E14_TIN_NAME_CONFLICT");
-        detail.tin_shared_by_different_names = res.cnt;
-      }
-    }
-    if (street) {
-      const res2 = await env.AUDIT_DB.prepare(
-        `SELECT COUNT(DISTINCT submission_id) as cnt FROM kyc_submissions WHERE raw_payload LIKE ?`
-      ).bind(`%"street":"${street}"%`).first();
-      if ((res2?.cnt ?? 0) >= 3) {
-        flags.push("E14_ADDRESS_SHARED");
-        detail.address_submission_count = res2.cnt;
-      }
-    }
-  } catch (e) { detail.error = e.message; }
-  return { engine: "E14_NETWORK_GRAPH", score: flags.length ? 20 : 0, flags, detail };
-}
-
-function engineE15_SyntheticIdentity(payload) {
-  if (payload.entity_type !== "individual") return { engine: "E15_SYNTHETIC_IDENTITY", score: 0, flags: [], detail: {} };
-  const tin = stripTin(payload.tin || "");
-  const area = parseInt(tin.slice(0, 3), 10);
-  const flagged = area >= 900;
-  return {
-    engine: "E15_SYNTHETIC_IDENTITY",
-    score: flagged ? 40 : 0,
-    flags: flagged ? ["E15_SYNTHETIC_SSN"] : [],
-    detail: { ssn_area: area }
-  };
-}
-
-async function engineE16_WatchlistDelta(payload, env) {
-  const tin = stripTin(payload.tin || "");
-  const name = normalName(payload.applicant_name || payload.business_name || "");
-  let flags = []; const detail = {};
-  try {
-    const delta = await parseKVList(env.KYC_SANCTIONS, "sdn:delta:7d");
-    const tinHit = delta.some(e => (typeof e === "object" ? e.tin : "") === tin);
-    const nameHits = fuzzyMatch(name, delta.map(e => typeof e === "object" ? e.name || "" : e));
-    if (tinHit) { flags.push("E16_DELTA_TIN_HIT"); detail.tin_in_delta = true; }
-    if (nameHits.length) { flags.push("E16_DELTA_NAME_HIT"); detail.name_match = nameHits[0]; }
-  } catch (e) { detail.error = e.message; }
-  return { engine: "E16_WATCHLIST_DELTA", score: flags.length ? 30 : 0, flags, detail };
-}
-
-async function engineE17_FinCEN(payload, env) {
-  const list = await parseKVList(env.KYC_SANCTIONS, "fincen:314a");
-  const names = [payload.applicant_name, payload.business_name].filter(Boolean);
-  let score = 0; const flags = []; const detail = [];
-  for (const name of names) {
-    const hits = fuzzyMatch(name, list);
-    if (hits.length) {
-      score = Math.min(score + 25, 50);
-      flags.push("E17_FINCEN_314A");
-      detail.push(...hits.map(h => ({ name, match: h.entry, jw: h.jw, ts: h.ts })));
-    }
+async function engineAdverseCountryPair(payload) {
+  // E22: Address country ≠ nationality AND both FATF high-risk
+  const addrCountry = (payload.address?.country || '').toUpperCase();
+  const natCountry = (payload.nationality || payload.country_of_birth || '').toUpperCase();
+  if (addrCountry && natCountry && addrCountry !== natCountry &&
+      FATF_HIGH_RISK.has(addrCountry) && FATF_HIGH_RISK.has(natCountry)) {
+    return { score: 25, addrCountry, natCountry };
   }
-  return { engine: "E17_FINCEN_314A", score, flags, detail };
+  return { score: 0 };
 }
 
-async function engineE18_GeoVelocity(payload, env) {
-  const tin = stripTin(payload.tin || "");
-  const ip = payload.ip_address || "";
-  if (!tin || !ip) return { engine: "E18_GEO_VELOCITY", score: 0, flags: [], detail: { reason: "no TIN or IP" } };
-  try {
-    const cutoff = new Date(Date.now() - 3600000).toISOString();
-    const res = await env.AUDIT_DB.prepare(
-      `SELECT COUNT(DISTINCT raw_payload) as cnt FROM kyc_submissions WHERE tin=? AND created_at>=? AND raw_payload NOT LIKE ?`
-    ).bind(tin, cutoff, `%"ip_address":"${ip}"%`).first();
-    const flagged = (res?.cnt ?? 0) > 0;
-    return {
-      engine: "E18_GEO_VELOCITY",
-      score: flagged ? 20 : 0,
-      flags: flagged ? ["E18_GEO_VELOCITY_FLAGGED"] : [],
-      detail: { tin, ip, different_ip_count_1h: res?.cnt ?? 0 }
-    };
-  } catch (e) {
-    return { engine: "E18_GEO_VELOCITY", score: 0, flags: [], detail: { error: e.message } };
+// ── Core Screening Logic ───────────────────────────────────────────────────────
+
+async function screenPayload(payload, env, ip) {
+  const start = Date.now();
+
+  // Run all 22 engines in parallel with per-engine timeout isolation
+  function withTimeout(promise, ms = 400) {
+    return Promise.race([
+      promise,
+      new Promise(resolve => setTimeout(() => resolve({ score: 0, timeout: true }), ms))
+    ]);
   }
-}
 
-/* ─── SCREENING ORCHESTRATOR ─────────────────────────────── */
-
-async function runScreening(payload, env) {
-  const t0 = Date.now();
-
-  const enginePromises = [
-    engineE1_OFAC(payload, env),
-    engineE2_PEP(payload, env),
-    Promise.resolve(engineE3_FATF(payload)),
-    Promise.resolve(engineE4_TIN(payload)),
-    engineE5_Velocity(payload, env),
-    Promise.resolve(engineE6_Structuring(payload)),
-    Promise.resolve(engineE7_AdverseMedia(payload)),
-    engineE8_UBO(payload, env),
-    Promise.resolve(engineE9_DOB(payload)),
-    Promise.resolve(engineE10_Address(payload)),
-    Promise.resolve(engineE11_EntityConsistency(payload)),
-    Promise.resolve(engineE12_CorporateDepth(payload)),
-    Promise.resolve(engineE13_DocumentEntropy(payload)),
-    engineE14_NetworkGraph(payload, env),
-    Promise.resolve(engineE15_SyntheticIdentity(payload)),
-    engineE16_WatchlistDelta(payload, env),
-    engineE17_FinCEN(payload, env),
-    engineE18_GeoVelocity(payload, env),
-  ];
-
-  let timedOut = false;
-  let settled;
-
-  const race = Promise.race([
-    Promise.allSettled(enginePromises),
-    sleep(SCREEN_TIMEOUT_MS).then(() => { timedOut = true; return null; })
+  const [
+    r01, r02, r03, r04, r05, r06, r07, r08, r09, r10, r11,
+    r12, r13, r14, r15, r16, r17, r18, r19, r20, r21, r22
+  ] = await Promise.all([
+    withTimeout(engineOFAC(payload, env)),
+    withTimeout(enginePEP(payload, env)),
+    withTimeout(engineFATF(payload)),
+    withTimeout(engineTIN(payload)),
+    withTimeout(engineVelocity(payload, env)),
+    withTimeout(engineStructuring(payload)),
+    withTimeout(engineAdverseMedia(payload)),
+    withTimeout(engineUBO(payload, env)),
+    withTimeout(engineDOB(payload)),
+    withTimeout(engineAddressRisk(payload)),
+    withTimeout(engineEntityConsistency(payload)),
+    withTimeout(engineCorporateDepth(payload)),
+    withTimeout(engineDocumentEntropy(payload)),
+    withTimeout(engineNetworkGraph(payload, env)),
+    withTimeout(engineSyntheticId(payload)),
+    withTimeout(engineWatchlistDelta(payload, env)),
+    withTimeout(engineFinCEN314a(payload, env)),
+    withTimeout(engineGeoVelocity(payload, env, ip)),
+    withTimeout(engineCOBFATF(payload)),
+    withTimeout(engineSecondDegreePEP(payload, env)),
+    withTimeout(engineITINExpiry(payload)),
+    withTimeout(engineAdverseCountryPair(payload))
   ]);
 
-  settled = await race;
+  const latency = Date.now() - start;
+  const timedOut = latency >= TIMEOUT_MS;
 
-  const latency = Date.now() - t0;
+  const rawScore = r01.score + r02.score + r03.score + r04.score + r05.score +
+    r06.score + r07.score + r08.score + r09.score + r10.score + r11.score +
+    r12.score + r13.score + r14.score + r15.score + r16.score + r17.score +
+    r18.score + r19.score + r20.score + r21.score + r22.score;
 
-  if (timedOut || !settled) {
-    return {
-      results: [],
-      score: 35,
-      flags: ["TIMEOUT_AUTO_REVIEW"],
-      risk_decision: "REVIEW",
-      timedOut: true,
-      completed: 0,
-      latency
-    };
-  }
-
-  const results = settled.map(r => r.status === "fulfilled" ? r.value : {
-    engine: "UNKNOWN", score: 0, flags: [], detail: { error: r.reason?.message }
-  });
-
-  const e4 = results[3] || {};
-  const e8 = results[7] || {};
-
-  let totalScore = results.reduce((acc, r) => acc + (r.score || 0), 0);
-  totalScore = Math.min(totalScore, 100);
-
-  const flags = results.flatMap(r => r.flags || []);
-  const velocityFlagged = flags.includes("E5_VELOCITY_FLAGGED") ? 1 : 0;
-  const structuringFlagged = flags.includes("E6_STRUCTURING") ? 1 : 0;
-  const adverseMediaHits = results[6]?.detail?.keywords_matched?.length || 0;
-  const ofacHitsArr = results[0]?.detail || [];
-  const pepHitsArr = results[1]?.detail || [];
+  const risk_score = Math.min(rawScore, 100);
 
   let risk_decision;
-  if (totalScore >= 70) risk_decision = "DENIED";
-  else if (totalScore >= 30) risk_decision = "REVIEW";
-  else risk_decision = "APPROVED";
+  if (timedOut) {
+    risk_decision = 'REVIEW';
+  } else if (risk_score <= APPROVE_MAX) {
+    risk_decision = 'APPROVED';
+  } else if (risk_score <= REVIEW_MAX) {
+    risk_decision = 'REVIEW';
+  } else {
+    risk_decision = 'DENIED';
+  }
 
-  return {
-    results,
-    score: totalScore,
-    flags,
-    risk_decision,
-    timedOut: false,
-    completed: results.length,
-    latency,
-    tinValid: e4.tinValid || false,
-    einValid: e4.einValid || false,
-    ofacHits: ofacHitsArr.length,
-    pepHits: pepHitsArr.length,
-    sanctionsHits: ofacHitsArr.length + pepHitsArr.length,
-    uboResults: e8.uboResults || [],
-    velocityFlagged,
-    structuringFlagged,
-    adverseMediaHits,
-    ofacHitsJson: JSON.stringify(ofacHitsArr),
-    pepHitsJson: JSON.stringify(pepHitsArr),
-    riskBreakdown: JSON.stringify(results.map(r => ({ engine: r.engine, score: r.score, flags: r.flags })))
+  const breakdown = {
+    E01_ofac_sdn:            r01,
+    E02_pep:                 r02,
+    E03_fatf_country:        r03,
+    E04_tin_validation:      r04,
+    E05_velocity:            r05,
+    E06_structuring:         r06,
+    E07_adverse_media:       r07,
+    E08_ubo_cascade:         r08,
+    E09_dob_plausibility:    r09,
+    E10_address_risk:        r10,
+    E11_entity_consistency:  r11,
+    E12_corporate_depth:     r12,
+    E13_document_entropy:    r13,
+    E14_network_graph:       r14,
+    E15_synthetic_id:        r15,
+    E16_watchlist_delta:     r16,
+    E17_fincen_314a:         r17,
+    E18_geo_velocity:        r18,
+    E19_cob_fatf:            r19,
+    E20_second_degree_pep:   r20,
+    E21_itin_expiry:         r21,
+    E22_adverse_country_pair: r22
   };
+
+  return { risk_score, risk_decision, breakdown, latency_ms: latency, timed_out: timedOut };
 }
 
-/* ─── D1 PERSISTENCE ─────────────────────────────────────── */
+// ── Auth Helpers ───────────────────────────────────────────────────────────────
 
-async function persistSubmission(env, submissionId, payload, screening, ctx) {
-  const tin = stripTin(payload.tin || "");
-  const now = nowISO();
+async function authUser(request, env) {
+  const apiKey = request.headers.get('X-API-Key') || request.headers.get('Authorization')?.replace('Bearer ', '');
+  if (!apiKey) return false;
+  const stored = await env.GATEWAY_AUTH.get(`apikey:${apiKey}`);
+  return !!stored;
+}
 
-  const insertSubmission = env.AUDIT_DB.prepare(`
-    INSERT INTO kyc_submissions
-      (submission_id,entity_type,applicant_name,tin,tin_formatted,status,risk_score,
-       risk_decision,risk_breakdown,sanctions_hits,ofac_hits,pep_hits,tin_valid,ein_valid,
-       screen_latency_ms,raw_payload,screened_at,flags_json,pep_hits_json,ofac_hits_json,
-       velocity_flagged,structuring_flagged,adverse_media_hits,engine_version)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+function authAdmin(request, env) {
+  const key = request.headers.get('X-Admin-Key') || request.headers.get('Authorization')?.replace('Bearer ', '');
+  return key === env.KYC_ADMIN_KEY;
+}
+
+// ── D1 Persistence ─────────────────────────────────────────────────────────────
+
+async function persistSubmission(db, submissionId, payload, result) {
+  const now = new Date().toISOString();
+  await db.prepare(`
+    INSERT OR IGNORE INTO kyc_submissions
+      (submission_id, entity_type, applicant_name, tin, status, risk_score, risk_decision,
+       risk_breakdown, sanctions_hits, ofac_hits, pep_hits, tin_valid, screen_latency_ms,
+       raw_payload, screened_at, created_at, flags_json, velocity_flagged, structuring_flagged,
+       adverse_media_hits, engine_version)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `).bind(
     submissionId,
-    payload.entity_type || "",
-    payload.applicant_name || payload.business_name || "",
-    tin,
-    formatTin(tin, payload.entity_type),
-    "screened",
-    screening.score,
-    screening.risk_decision,
-    screening.riskBreakdown || "[]",
-    screening.sanctionsHits || 0,
-    screening.ofacHits || 0,
-    screening.pepHits || 0,
-    screening.tinValid ? 1 : 0,
-    screening.einValid ? 1 : 0,
-    screening.latency,
+    payload.entity_type || 'individual',
+    payload.name || payload.business_name || '',
+    (payload.tin || payload.ssn || payload.ein || '').replace(/[^0-9]/g, '').slice(0, 9),
+    result.risk_decision,
+    result.risk_score,
+    result.risk_decision,
+    JSON.stringify(result.breakdown),
+    (result.breakdown.E01_ofac_sdn?.hits?.length || 0) + (result.breakdown.E17_fincen_314a?.hits?.length || 0),
+    result.breakdown.E01_ofac_sdn?.hits?.length || 0,
+    result.breakdown.E02_pep?.hits?.length || 0,
+    result.breakdown.E04_tin_validation?.score === 0 ? 1 : 0,
+    result.latency_ms,
     JSON.stringify(payload),
     now,
-    JSON.stringify(screening.flags || []),
-    screening.pepHitsJson || "[]",
-    screening.ofacHitsJson || "[]",
-    screening.velocityFlagged || 0,
-    screening.structuringFlagged || 0,
-    screening.adverseMediaHits || 0,
-    ENGINE_VERSION
-  );
+    now,
+    JSON.stringify({ timed_out: result.timed_out }),
+    result.breakdown.E05_velocity?.score > 0 ? 1 : 0,
+    result.breakdown.E06_structuring?.score > 0 ? 1 : 0,
+    result.breakdown.E07_adverse_media?.hits?.length || 0,
+    VERSION
+  ).run();
+}
 
-  const insertAudit = env.AUDIT_DB.prepare(`
-    INSERT INTO audit_log (event_id,event_type,entity_id,entity_type,payload,created_at)
-    VALUES (?,?,?,?,?,?)
+async function enqueueReview(db, submissionId, payload, result) {
+  await db.prepare(`
+    INSERT OR IGNORE INTO kyc_review_queue
+      (reference_id, type, flags_json, payload_json, status)
+    VALUES (?,?,?,?,?)
   `).bind(
-    uuid(),
-    "kyc.screened",
     submissionId,
-    payload.entity_type || "",
-    JSON.stringify({ score: screening.score, decision: screening.risk_decision, flags: screening.flags }),
-    now
+    result.risk_decision,
+    JSON.stringify(Object.entries(result.breakdown)
+      .filter(([, v]) => v.score > 0)
+      .map(([k, v]) => ({ engine: k, score: v.score }))),
+    JSON.stringify(payload),
+    'pending'
+  ).run();
+}
+
+async function writeAuditLog(db, eventType, entityId, detail) {
+  await db.prepare(`
+    INSERT INTO audit_log (event_id, event_type, entity_id, entity_type, detail, created_at)
+    VALUES (?,?,?,?,?,?)
+  `).bind(uid(), eventType, entityId, 'kyc_submission', JSON.stringify(detail), new Date().toISOString()).run();
+}
+
+// ── Route Handlers ─────────────────────────────────────────────────────────────
+
+async function handleApply(request, env, ctx) {
+  const authed = await authUser(request, env);
+  if (!authed) return json({ error: 'Unauthorized' }, 401);
+
+  let payload;
+  try { payload = await request.json(); } catch { return json({ error: 'Invalid JSON' }, 400); }
+
+  if (!payload.name && !payload.business_name)
+    return json({ error: 'name or business_name required' }, 400);
+
+  const submissionId = uid();
+  const ip = request.headers.get('CF-Connecting-IP') || '';
+  const fingerprint = await sha256Hex(JSON.stringify(payload) + ip);
+
+  // Hard timeout guard around the entire screening pass
+  const screeningPromise = screenPayload(payload, env, ip);
+  const timeoutPromise = new Promise(resolve =>
+    setTimeout(() => resolve(null), TIMEOUT_MS + 100)
   );
 
-  const stmts = [insertSubmission, insertAudit];
-
-  if (screening.risk_decision === "REVIEW" || screening.timedOut) {
-    const insertReview = env.AUDIT_DB.prepare(`
-      INSERT INTO kyc_review_queue
-        (submission_id,reference_id,type,flags_json,payload_json,status,risk_score,created_at)
-      VALUES (?,?,?,?,?,?,?,?)
-    `).bind(
-      submissionId,
-      submissionId,
-      payload.entity_type === "business" ? "KYB" : "KYC",
-      JSON.stringify(screening.flags || []),
-      JSON.stringify(payload),
-      "pending",
-      screening.score,
-      now
-    );
-    stmts.push(insertReview);
+  let result = await Promise.race([screeningPromise, timeoutPromise]);
+  if (!result) {
+    result = {
+      risk_score: 50,
+      risk_decision: 'REVIEW',
+      breakdown: {},
+      latency_ms: TIMEOUT_MS + 100,
+      timed_out: true
+    };
   }
 
-  for (const ubo of (screening.uboResults || [])) {
-    stmts.push(env.AUDIT_DB.prepare(`
-      INSERT INTO kyc_beneficial_owners
-        (submission_id,owner_name,ownership_pct,tin,nationality,sanctions_score,
-         pep_flag,ofac_hit,is_flagged,match_reason,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    `).bind(
-      submissionId,
-      ubo.name || "",
-      ubo.ownership_pct || 0,
-      ubo.tin || "",
-      ubo.nationality || "",
-      ubo.sanctionsScore || 0,
-      ubo.pepFlag || 0,
-      ubo.ofacHit || 0,
-      ubo.isFlagged || 0,
-      ubo.matchReason || "",
-      now
-    ));
-  }
+  // Persist to D1 (non-blocking for latency)
+  ctx.waitUntil((async () => {
+    try {
+      await persistSubmission(env.AUDIT_DB, submissionId, payload, result);
+      if (result.risk_decision !== 'APPROVED') {
+        await enqueueReview(env.AUDIT_DB, submissionId, payload, result);
+      }
+      await writeAuditLog(env.AUDIT_DB, 'kyc.screened', submissionId, {
+        decision: result.risk_decision, score: result.risk_score
+      });
+      // Fire DENIED system alert
+      if (result.risk_decision === 'DENIED' && env.NOTIFIER_TOKEN) {
+        await fetch('https://notify.wwwknockoutforever.com/webhook/system-alert', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${env.NOTIFIER_TOKEN}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            event_type: 'SYSTEM_ALERT',
+            severity: 'HIGH',
+            message: `KYC DENIED: ${payload.name || payload.business_name} — score ${result.risk_score}`,
+            submission_id: submissionId
+          })
+        }).catch(() => {});
+      }
+    } catch {}
+  })());
 
-  ctx.waitUntil(env.AUDIT_DB.batch(stmts).catch(() => {}));
-}
+  const responseHeaders = {
+    'X-Submission-Id': submissionId,
+    'X-Risk-Score': String(result.risk_score),
+    'X-Risk-Decision': result.risk_decision,
+    'X-Engine-Version': VERSION
+  };
 
-async function fireSystemAlert(submissionId, screening, env) {
-  try {
-    await fetch("https://notify.wwwknockoutforever.com/webhook/system-alert", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${env.NOTIFIER_TOKEN}`
-      },
-      body: JSON.stringify({
-        event: "SYSTEM_ALERT",
-        submission_id: submissionId,
-        risk_decision: "DENIED",
-        risk_score: screening.score,
-        flags: screening.flags,
-        timestamp: nowISO()
-      })
-    });
-  } catch (_) {}
-}
-
-/* ─── ROUTE HANDLERS ─────────────────────────────────────── */
-
-async function handleApply(req, env, ctx, cors) {
-  let payload;
-  try { payload = await req.json(); }
-  catch { return errResp("Invalid JSON body", 400, cors); }
-
-  if (!payload.entity_type || !["individual", "business"].includes(payload.entity_type)) {
-    return errResp("entity_type must be 'individual' or 'business'", 422, cors);
-  }
-
-  const submissionId = `kyc_${uuid()}`;
-  const screening = await runScreening(payload, env);
-
-  await persistSubmission(env, submissionId, payload, screening, ctx);
-
-  if (screening.risk_decision === "DENIED") {
-    ctx.waitUntil(fireSystemAlert(submissionId, screening, env));
-  }
-
-  let agReason;
-  if (screening.risk_decision === "APPROVED") agReason = "All screening checks passed";
-  else if (screening.risk_decision === "REVIEW") agReason = "Risk score requires human review";
-  else agReason = "Application denied based on risk screening";
-
-  return new Response(JSON.stringify({
+  return json({
     submission_id: submissionId,
-    status: "screened",
-    risk_decision: screening.risk_decision,
-    risk_score: screening.score,
-    account_generation: {
-      allowed: screening.risk_decision === "APPROVED",
-      reason: agReason
-    },
-    flags: screening.flags,
-    engines: {
-      count: 18,
-      completed: screening.timedOut ? 0 : screening.completed,
-      timed_out: screening.timedOut
-    },
-    screen_latency_ms: screening.latency,
-    review_queued: screening.risk_decision === "REVIEW",
-    timestamp: nowISO()
-  }), {
-    status: 200,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Submission-Id": submissionId,
-      ...cors
-    }
+    fingerprint,
+    risk_score: result.risk_score,
+    risk_decision: result.risk_decision,
+    latency_ms: result.latency_ms,
+    timed_out: result.timed_out,
+    engines: { count: ENGINE_COUNT, version: VERSION },
+    risk_breakdown: result.breakdown,
+    account_generation: { allowed: result.risk_decision === 'APPROVED' },
+    flags: Object.entries(result.breakdown)
+      .filter(([, v]) => v.score > 0)
+      .map(([k, v]) => ({ engine: k, score: v.score }))
+  }, 200, responseHeaders);
+}
+
+async function handleStatus(id, env) {
+  const row = await env.AUDIT_DB.prepare(
+    'SELECT submission_id, status, risk_score, risk_decision, screened_at FROM kyc_submissions WHERE submission_id = ?'
+  ).bind(id).first();
+  if (!row) return json({ error: 'Not found' }, 404);
+  return json(row);
+}
+
+async function handleReviewList(request, env) {
+  if (!authAdmin(request, env)) return json({ error: 'Forbidden' }, 403);
+  const url = new URL(request.url);
+  const page = parseInt(url.searchParams.get('page') || '1');
+  const perPage = Math.min(parseInt(url.searchParams.get('per_page') || '20'), 100);
+  const status = url.searchParams.get('status') || 'pending';
+  const offset = (page - 1) * perPage;
+  const rows = await env.AUDIT_DB.prepare(
+    'SELECT reference_id, type, status, flags_json, created_at FROM kyc_review_queue WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?'
+  ).bind(status, perPage, offset).all();
+  return json({ page, per_page: perPage, items: rows.results || [] });
+}
+
+async function handleReviewAction(id, action, request, env) {
+  if (!authAdmin(request, env)) return json({ error: 'Forbidden' }, 403);
+  const validActions = ['approve', 'reject', 'escalate'];
+  if (!validActions.includes(action)) return json({ error: 'Invalid action' }, 400);
+
+  const statusMap = { approve: 'approved', reject: 'rejected', escalate: 'escalated' };
+  const now = new Date().toISOString();
+
+  await env.AUDIT_DB.prepare(
+    'UPDATE kyc_review_queue SET status = ?, resolved_at = ? WHERE reference_id = ?'
+  ).bind(statusMap[action], now, id).run();
+
+  await env.AUDIT_DB.prepare(
+    'UPDATE kyc_submissions SET status = ? WHERE submission_id = ?'
+  ).bind(statusMap[action], id).run();
+
+  await writeAuditLog(env.AUDIT_DB, `kyc.${action}`, id, { action, timestamp: now });
+
+  return json({ submission_id: id, action, status: statusMap[action], timestamp: now });
+}
+
+async function handleBatch(request, env, ctx) {
+  if (!authAdmin(request, env)) return json({ error: 'Forbidden' }, 403);
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'Invalid JSON' }, 400); }
+  const submissions = body.submissions || [];
+  if (!submissions.length || submissions.length > 50)
+    return json({ error: 'submissions must be 1-50 items' }, 400);
+
+  const ip = request.headers.get('CF-Connecting-IP') || '';
+  const results = await Promise.all(submissions.map(async p => {
+    const id = uid();
+    const result = await screenPayload(p, env, ip);
+    ctx.waitUntil(persistSubmission(env.AUDIT_DB, id, p, result).catch(() => {}));
+    return { submission_id: id, risk_score: result.risk_score, risk_decision: result.risk_decision, latency_ms: result.latency_ms };
+  }));
+
+  return json({ count: results.length, results });
+}
+
+async function handleStats(request, env) {
+  if (!authAdmin(request, env)) return json({ error: 'Forbidden' }, 403);
+  const [total, approved, review, denied] = await Promise.all([
+    env.AUDIT_DB.prepare('SELECT COUNT(*) as n FROM kyc_submissions').first(),
+    env.AUDIT_DB.prepare("SELECT COUNT(*) as n FROM kyc_submissions WHERE risk_decision='APPROVED'").first(),
+    env.AUDIT_DB.prepare("SELECT COUNT(*) as n FROM kyc_submissions WHERE risk_decision='REVIEW'").first(),
+    env.AUDIT_DB.prepare("SELECT COUNT(*) as n FROM kyc_submissions WHERE risk_decision='DENIED'").first()
+  ]);
+  return json({
+    total: total?.n || 0,
+    approved: approved?.n || 0,
+    review: review?.n || 0,
+    denied: denied?.n || 0,
+    engines: { count: ENGINE_COUNT, version: VERSION },
+    decision_bands: { approved: '0-29', review: '30-69', denied: '70-100', timeout: 'auto-REVIEW' }
   });
 }
 
-async function handleStatus(submissionId, env, cors) {
-  try {
-    const row = await env.AUDIT_DB.prepare(
-      `SELECT * FROM kyc_submissions WHERE submission_id=?`
-    ).bind(submissionId).first();
-    if (!row) return errResp("Submission not found", 404, cors);
-    return jsonResp(row, 200, cors);
-  } catch (e) {
-    return errResp(e.message, 500, cors);
-  }
+function handleHealth() {
+  return json({ status: 'ok', version: VERSION, engines: ENGINE_COUNT, timeout_ms: TIMEOUT_MS, ts: Date.now() });
 }
 
-async function handleReviewQueue(req, env, cors) {
-  const url = new URL(req.url);
-  const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10));
-  const perPage = Math.min(100, Math.max(1, parseInt(url.searchParams.get("per_page") || "20", 10)));
-  const status = url.searchParams.get("status") || "pending";
-  const offset = (page - 1) * perPage;
-  try {
-    const rows = await env.AUDIT_DB.prepare(
-      `SELECT * FROM kyc_review_queue WHERE status=? ORDER BY created_at DESC LIMIT ? OFFSET ?`
-    ).bind(status, perPage, offset).all();
-    const countRow = await env.AUDIT_DB.prepare(
-      `SELECT COUNT(*) as total FROM kyc_review_queue WHERE status=?`
-    ).bind(status).first();
-    return jsonResp({
-      data: rows.results || [],
-      page,
-      per_page: perPage,
-      total: countRow?.total ?? 0,
-      status_filter: status
-    }, 200, cors);
-  } catch (e) {
-    return errResp(e.message, 500, cors);
-  }
-}
-
-async function handleReviewAction(reviewId, action, req, env, cors) {
-  let body = {};
-  try { body = await req.json(); } catch {}
-  const now = nowISO();
-  const statusMap = { approve: "approved", reject: "rejected", escalate: "escalated" };
-  const newStatus = statusMap[action];
-  if (!newStatus) return errResp("Unknown action", 400, cors);
-
-  try {
-    const existing = await env.AUDIT_DB.prepare(
-      `SELECT * FROM kyc_review_queue WHERE submission_id=?`
-    ).bind(reviewId).first();
-    if (!existing) return errResp("Review item not found", 404, cors);
-
-    await env.AUDIT_DB.prepare(
-      `UPDATE kyc_review_queue SET status=?,resolved_by=?,resolved_at=?,escalation_reason=? WHERE submission_id=?`
-    ).bind(newStatus, body.resolved_by || "admin", now, body.reason || null, reviewId).run();
-
-    if (action === "approve" || action === "reject") {
-      await env.AUDIT_DB.prepare(
-        `UPDATE kyc_submissions SET status=?,risk_decision=? WHERE submission_id=?`
-      ).bind(newStatus, action === "approve" ? "APPROVED" : "DENIED", reviewId).run();
-    }
-
-    return jsonResp({ submission_id: reviewId, action, status: newStatus, resolved_at: now }, 200, cors);
-  } catch (e) {
-    return errResp(e.message, 500, cors);
-  }
-}
-
-async function handleBatch(req, env, ctx, cors) {
-  let body;
-  try { body = await req.json(); } catch { return errResp("Invalid JSON", 400, cors); }
-  const items = Array.isArray(body) ? body : body.submissions || [];
-  if (!items.length || items.length > 50) return errResp("Batch must contain 1–50 submissions", 422, cors);
-
-  const results = await Promise.allSettled(items.map(async (payload) => {
-    if (!payload.entity_type) throw new Error("Missing entity_type");
-    const submissionId = `kyc_${uuid()}`;
-    const screening = await runScreening(payload, env);
-    await persistSubmission(env, submissionId, payload, screening, ctx);
-    if (screening.risk_decision === "DENIED") ctx.waitUntil(fireSystemAlert(submissionId, screening, env));
-    return { submission_id: submissionId, risk_decision: screening.risk_decision, risk_score: screening.score, flags: screening.flags };
-  }));
-
-  return jsonResp({
-    processed: results.length,
-    results: results.map((r, i) => r.status === "fulfilled" ? r.value : { index: i, error: r.reason?.message })
-  }, 200, cors);
-}
-
-async function handleStats(env, cors) {
-  try {
-    const [total, byDecision, avgScore] = await Promise.all([
-      env.AUDIT_DB.prepare(`SELECT COUNT(*) as total FROM kyc_submissions`).first(),
-      env.AUDIT_DB.prepare(`SELECT risk_decision, COUNT(*) as cnt FROM kyc_submissions GROUP BY risk_decision`).all(),
-      env.AUDIT_DB.prepare(`SELECT AVG(risk_score) as avg_score, AVG(screen_latency_ms) as avg_latency FROM kyc_submissions`).first()
-    ]);
-    const decisions = {};
-    for (const row of (byDecision.results || [])) decisions[row.risk_decision || "UNKNOWN"] = row.cnt;
-    return jsonResp({
-      total_submissions: total?.total ?? 0,
-      decisions,
-      avg_risk_score: +(avgScore?.avg_score || 0).toFixed(2),
-      avg_latency_ms: +(avgScore?.avg_latency || 0).toFixed(2),
-      engine_version: ENGINE_VERSION
-    }, 200, cors);
-  } catch (e) {
-    return errResp(e.message, 500, cors);
-  }
-}
-
-/* ─── MAIN FETCH HANDLER ─────────────────────────────────── */
+// ── Main Fetch Handler ─────────────────────────────────────────────────────────
 
 export default {
-  async fetch(req, env, ctx) {
-    const cors = corsHeaders(req);
+  async fetch(request, env, ctx) {
+    if (request.method === 'OPTIONS') return cors(new Response(null, { status: 204 }));
 
-    // OPTIONS preflight
-    if (req.method === "OPTIONS") {
-      return new Response(null, { status: 200, headers: cors });
-    }
-
-    const url = new URL(req.url);
+    const url = new URL(request.url);
     const path = url.pathname;
-    const method = req.method;
+    const method = request.method;
 
-    // Health check (unauthenticated)
-    if (path === "/api/kyc/health" && method === "GET") {
-      return jsonResp({
-        status: "ok",
-        version: ENGINE_VERSION,
-        timestamp: nowISO(),
-        service: "kyc-gateway"
-      }, 200, cors);
-    }
+    // Health (unauthenticated)
+    if (path === '/api/kyc/health' && method === 'GET') return handleHealth();
 
-    // POST /api/kyc/apply
-    if (path === "/api/kyc/apply" && method === "POST") {
-      if (!(await verifyGatewayAuth(req, env))) return errResp("Unauthorized", 401, cors);
-      return handleApply(req, env, ctx, cors);
-    }
+    // Apply
+    if (path === '/api/kyc/apply' && method === 'POST') return handleApply(request, env, ctx);
 
-    // GET /api/kyc/status/:id
-    const statusMatch = path.match(/^\/api\/kyc\/status\/(.+)$/);
-    if (statusMatch && method === "GET") {
-      if (!(await verifyGatewayAuth(req, env))) return errResp("Unauthorized", 401, cors);
-      return handleStatus(statusMatch[1], env, cors);
-    }
+    // Status
+    const statusMatch = path.match(/^\/api\/kyc\/status\/([^/]+)$/);
+    if (statusMatch && method === 'GET') return handleStatus(statusMatch[1], env);
 
-    // Admin routes
-    if (!verifyAdminKey(req, env) && path !== "/api/kyc/health") {
-      // Check if it's an admin-only route
-      const adminRoutes = ["/api/kyc/review", "/api/kyc/batch", "/api/kyc/stats"];
-      const isAdminRoute = adminRoutes.some(r => path.startsWith(r));
-      if (isAdminRoute) return errResp("Unauthorized", 401, cors);
-    }
+    // Review list
+    if (path === '/api/kyc/review' && method === 'GET') return handleReviewList(request, env);
 
-    // GET /api/kyc/review
-    if (path === "/api/kyc/review" && method === "GET") {
-      if (!verifyAdminKey(req, env)) return errResp("Unauthorized", 401, cors);
-      return handleReviewQueue(req, env, cors);
-    }
+    // Review actions
+    const reviewAction = path.match(/^\/api\/kyc\/review\/([^/]+)\/(approve|reject|escalate)$/);
+    if (reviewAction && method === 'POST') return handleReviewAction(reviewAction[1], reviewAction[2], request, env);
 
-    // POST /api/kyc/review/:id/approve|reject|escalate
-    const reviewMatch = path.match(/^\/api\/kyc\/review\/([^/]+)\/(approve|reject|escalate)$/);
-    if (reviewMatch && method === "POST") {
-      if (!verifyAdminKey(req, env)) return errResp("Unauthorized", 401, cors);
-      return handleReviewAction(reviewMatch[1], reviewMatch[2], req, env, cors);
-    }
+    // Batch
+    if (path === '/api/kyc/batch' && method === 'POST') return handleBatch(request, env, ctx);
 
-    // POST /api/kyc/batch
-    if (path === "/api/kyc/batch" && method === "POST") {
-      if (!verifyAdminKey(req, env)) return errResp("Unauthorized", 401, cors);
-      return handleBatch(req, env, ctx, cors);
-    }
+    // Stats
+    if (path === '/api/kyc/stats' && method === 'GET') return handleStats(request, env);
 
-    // GET /api/kyc/stats
-    if (path === "/api/kyc/stats" && method === "GET") {
-      if (!verifyAdminKey(req, env)) return errResp("Unauthorized", 401, cors);
-      return handleStats(env, cors);
-    }
-
-    return errResp("Not found", 404, cors);
+    return json({ error: 'Not found', path }, 404);
   }
 };
